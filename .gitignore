@@ -1,0 +1,42 @@
+# ── Secrets & personal data (NEVER commit) ──
+launch_jarvis.bat
+start_jarvis.bat
+jarvis_config.json
+credentials.json
+token.json
+jarvis_memory.json
+jarvis_todo.json
+telegram_data/
+
+# ── Heavy / downloaded models ──
+.venv/
+piper_models/
+*.onnx
+*.onnx.json
+
+# ── Generated / runtime ──
+logs/
+tts_cache/
+__pycache__/
+*.pyc
+temp_jarvis_speech*.wav
+temp_jarvis_speech*.mp3
+test_output.wav
+_*.wav
+_*.mp3
+
+# ── IDE / tooling / agent state (not part of the project) ──
+.idea/
+.omc/
+.vscode/
+
+# large full voice recording (over GitHub 100MB limit)
+jarvis_sample_full.wav
+*_full.wav
+
+# internal working notes - not part of the public project
+AGENTS.md
+CLAUDE.md
+ROADMAP.md
+.cursor/
+.claude/
