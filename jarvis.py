@@ -1,3 +1,5 @@
+# Джарвис — голосовой помощник для Windows: слушает, отвечает голосом и выполняет команды
+
 import os
 import subprocess
 import time
@@ -252,6 +254,7 @@ _recognizer = None
 _interrupt_event = threading.Event()
 
 
+# закончили говорить — ненадолго глушим микрофон, чтобы не слышать себя
 def _set_done_speaking():
     """Mark TTS as finished, start the mic cooldown, and open the follow-up window."""
     global _is_speaking, _speaking_cooldown_until, _wake_active_until
@@ -1192,6 +1195,7 @@ def _play_audio_bytes(data: bytes, suffix: str = ".mp3") -> bool:
                 pass
 
 
+# озвучиваем ответ вслух
 def speak(text: str):
     """Speak text aloud. Interruptible — stops instantly on barge-in."""
     global _last_spoken_text
@@ -1977,6 +1981,7 @@ def extract_open_app_request(text: str) -> str | None:
     return query or None
 
 
+# открываем программу, сайт или приложение
 def execute_system_command(cmd: str) -> bool:
     """Open a known target or resolve any installed Windows application."""
     cmd = cmd.lower().strip()
@@ -2064,6 +2069,7 @@ def execute_system_command(cmd: str) -> bool:
         return False
 
 
+# выполняем команду в PowerShell
 def run_shell_command(cmd: str) -> str:
     """Execute a command in PowerShell and return a short spoken summary.
 
@@ -2203,6 +2209,7 @@ def _protected_roots() -> list:
     return [r for r in roots if r]
 
 
+# не даём снести систему или проект
 def is_code_safe(code: str) -> tuple[bool, str]:
     """Anti-wipe filter (ROADMAP §2.1). Returns (ok, reason).
 
@@ -3176,6 +3183,7 @@ def _llm_deltas(messages: list, prefer: str = "local"):
     raise last_err or RuntimeError("Все LLM-движки недоступны")
 
 
+# спрашиваем модель: сначала локальную, потом облако
 def process_with_llm_streaming(user_text: str) -> str:
     """LLM streaming -> first sentence plays in ~300-500ms instead of waiting for full response.
 
@@ -3437,6 +3445,7 @@ def transcribe_whisper(audio) -> str | None:
         return None
 
 
+# переводим речь в текст
 def transcribe_speech(recognizer, audio) -> str:
     """Unified STT: local whisper if available, else Google. '' means no speech."""
     global _last_stt_ms
@@ -3502,6 +3511,7 @@ def _wake_indices(text: str):
     return toks, None
 
 
+# ловим "Джарвис", даже если распозналось криво
 def contains_wake_word(text: str) -> bool:
     """True if the text contains the wake word in any form Whisper might render it."""
     return _wake_indices(text)[1] is not None
@@ -3524,6 +3534,7 @@ def _audio_duration(audio) -> float:
         return 0.0
 
 
+# сюда приходит распознанная с микрофона речь
 def callback(recognizer, audio):
     global _wake_active_until
     try:
@@ -3754,6 +3765,7 @@ class JarvisApi:
         return True
 
 
+# выбираем микрофон, по возможности USB
 def _select_mic():
     """Pick the input device, printing the list so a wrong default is visible.
 
@@ -3798,6 +3810,7 @@ def _select_mic():
     return None
 
 
+# запуск: микрофон, фоновый слушатель и главный цикл
 def run_assistant():
     global _recognizer
     pygame.mixer.init()

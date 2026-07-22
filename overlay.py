@@ -1,3 +1,5 @@
+# Полоски-визуализация голоса по краю экрана (отдельный процесс)
+
 """Screen-edge voice visualiser for J.A.R.V.I.S. — arc style.
 
 Concentric glowing arcs around all 4 screen edges (left, right, top, bottom),
@@ -40,6 +42,7 @@ def _dim(c: str, f: float) -> str:
     return f"#{int(r*f):02x}{int(g*f):02x}{int(b*f):02x}"
 
 
+# окно с волной, реагирующей на громкость голоса
 class Overlay:
     def __init__(self):
         self.root = tk.Tk()
@@ -147,6 +150,7 @@ class Overlay:
             })
 
 
+    # читаем команды от Джарвиса из stdin
     def _read_stdin(self):
         for line in sys.stdin:
             line = line.strip()
