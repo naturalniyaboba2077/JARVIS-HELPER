@@ -40,3 +40,11 @@ CLAUDE.md
 ROADMAP.md
 .cursor/
 .claude/
+
+# dev scratch and heavy optional assets (kept locally, not published)
+create_mock.py
+static_audit.py
+test_xtts.py
+voice_samples.py
+voice_samples/
+jarvis_sample.wav

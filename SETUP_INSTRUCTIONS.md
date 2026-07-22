@@ -67,23 +67,19 @@ Jarvis проверяет сервер, при необходимости зап
 
 ## Запуск
 
-Основной способ — desktop shortcut без консоли:
+Обычный запуск с видимой консолью и логами:
+
+```powershell
+python jarvis.py
+```
+
+Подробные события пишутся в `logs/jarvis_YYYY-MM-DD.log`.
+
+Ярлык на рабочем столе без консольного окна (`pythonw.exe jarvis.py`):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\install_shortcut.ps1
 ```
-
-Ярлык `J.A.R.V.I.S..lnk` запускает `pythonw.exe jarvis.py`. Вывод windowed-запуска
-пишется в `logs/console.log`, подробные события — в `logs/jarvis_YYYY-MM-DD.log`.
-
-Для диагностики:
-
-```powershell
-.\launch_jarvis.bat
-```
-
-`start_jarvis.bat` считается устаревшим локальным лаунчером и не должен хранить
-ключи или переопределять настройки.
 
 ## Голос и микрофон
 
@@ -108,7 +104,6 @@ Windows, системного реестра, репозитория и Obsidian
 & "$env:LOCALAPPDATA\Programs\Python\Python310\python.exe" test_regression.py
 & "$env:LOCALAPPDATA\Programs\Python\Python310\python.exe" test_jarvis_functions.py
 & "$env:LOCALAPPDATA\Programs\Python\Python310\python.exe" test_safety.py
-& "$env:LOCALAPPDATA\Programs\Python\Python310\python.exe" static_audit.py
 & "$env:LOCALAPPDATA\Programs\Python\Python310\python.exe" health_check.py
 ```
 

@@ -1,46 +1,73 @@
-# Jarvis Voice Assistant
+# Jarvis
 
-Локальный голосовой помощник для Windows с русской локализацией.
+Голосовой ассистент для Windows с управлением на русском. Слушает слово
+«Джарвис», распознаёт речь, отвечает голосом и выполняет действия: открывает
+приложения и сайты, включает музыку, выполняет команды в терминале, запускает
+Python, ведёт заметки, список дел и таймеры.
 
-## Возможности
+## Что нужно
 
-- Wake-word «Джарвис» / `Jarvis` с фонетическим и fuzzy-распознаванием.
-- Локальный STT через faster-whisper (`small`) с откатом на Google Speech.
-- Local-first LLM: Ollama для простых запросов, DeepSeek через OpenRouter для сложных.
-- TTS `auto`: локальный Piper при наличии модели, иначе edge-tts; доступны ручные режимы.
-- Локальные быстрые команды без обращения к LLM.
-- Действия через теги: приложения, музыка, терминал, Python, календарь, память и Obsidian.
-- Anti-wipe защита при выполнении кода: блокируется снос Windows, дисков, проекта и vault.
-- Нативное окно pywebview и отдельный экранный voice-overlay.
-- Панель настроек, самодиагностика и универсальное открытие установленных приложений.
+- Windows 10 или 11
+- Python 3.10
+- Микрофон
+- Ключ [OpenRouter](https://openrouter.ai) для облачной модели
+
+## Установка
+
+```powershell
+git clone https://github.com/naturalniyaboba2077/JARVIS-HELPER.git
+cd JARVIS-HELPER
+python -m pip install -r requirements.txt
+copy jarvis_config.example.json jarvis_config.json
+```
+
+Открой `jarvis_config.json` и впиши свой ключ в `OPENROUTER_API_KEY`.
+Файл с ключом в Git не попадает.
 
 ## Запуск
 
-Обычный запуск — ярлык `J.A.R.V.I.S..lnk` на рабочем столе. Он вызывает
-`pythonw.exe jarvis.py` без консольного окна. Создать ярлык заново:
-
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\install_shortcut.ps1
+python jarvis.py
 ```
 
-Для диагностики с видимой консолью:
+Скажи «Джарвис», дождись «Слушаю, сэр» и дай команду.
 
-```powershell
-.\launch_jarvis.bat
+## Быстрый старт без GPU и локальных моделей
+
+Чтобы всё заработало сразу, только через облако, поставь в `jarvis_config.json`:
+
+```json
+"JARVIS_LLM": "cloud",
+"STT_ENGINE": "google",
+"TTS_ENGINE": "edge"
 ```
 
-Настройки и API-ключ хранятся в gitignored-файле `jarvis_config.json`.
-Шаблон: `jarvis_config.example.json`. Переменные окружения имеют приоритет.
+Локальные ускорения ставятся по желанию: Ollama (`ollama pull qwen2.5:3b`) для
+быстрой офлайн-модели, faster-whisper на видеокарте для распознавания и Piper для
+офлайн-голоса. Подробности — в [SETUP_INSTRUCTIONS.md](SETUP_INSTRUCTIONS.md).
 
-## Проверка
+## Примеры команд
 
-Используй Python 3.10, которым запускается приложение:
+- «Джарвис, открой браузер»
+- «Джарвис, зайди на youtube.com»
+- «Джарвис, включи музыку»
+- «Джарвис, какая погода в Москве»
+- «Джарвис, поставь таймер на 10 минут»
+- «Джарвис, сделай скриншот»
+- «Джарвис, статус» — проверка LLM, распознавания, синтеза и памяти
+
+## Тесты
 
 ```powershell
-& "$env:LOCALAPPDATA\Programs\Python\Python310\python.exe" test_regression.py
-& "$env:LOCALAPPDATA\Programs\Python\Python310\python.exe" test_jarvis_functions.py
-& "$env:LOCALAPPDATA\Programs\Python\Python310\python.exe" test_safety.py
+python test_regression.py
+python test_jarvis_functions.py
+python test_safety.py
 ```
 
-Команда «статус Джарвиса» проверяет LLM, STT, TTS, память и каталог программ.
-Проверка окружения без запуска микрофона: `python health_check.py`.
+## Структура
+
+- `jarvis.py` — приложение целиком
+- `overlay.py` — экранная визуализация голоса (отдельный процесс)
+- `ui/` — окно интерфейса
+- `pc_apps.txt` — каталог установленных программ для команды «открой …»
+- `install_shortcut.ps1` — создаёт ярлык на рабочем столе
