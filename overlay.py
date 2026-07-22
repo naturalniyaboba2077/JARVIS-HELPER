@@ -17,18 +17,15 @@ import sys
 import threading
 import tkinter as tk
 
-# This colour is made transparent by Windows, so arcs float on the desktop.
 CHROMA = "#010203"
 
-N_ARCS     = 16      # concentric arcs per edge
-SPAN_FRAC  = 0.88    # fraction of the perpendicular screen dimension each arc spans
-MIN_DEPTH  = 14      # px — innermost arc protrusion from the edge
-DEPTH_STEP = 18      # px — spacing between consecutive arcs
+N_ARCS     = 16
+SPAN_FRAC  = 0.88
+MIN_DEPTH  = 14
+DEPTH_STEP = 18
 
-# Depths of arcs 0..N_ARCS-1 (0 = innermost, closest to screen centre)
 _DEPTHS = [MIN_DEPTH + DEPTH_STEP * i for i in range(N_ARCS)]
 
-# Core colours, innermost (0) → outermost (15): bright cyan → deep violet
 _CORE = [
     "#70e0ff", "#56d0ff", "#4ac0ff", "#40b0ff",
     "#40a0ff", "#4a8eff", "#5a7eff", "#6a72ff",
@@ -61,26 +58,25 @@ class Overlay:
         self._make_click_through()
 
         self.amp = 0.0
-        self.cur = 0.0       # eased amplitude
-        self.vis = 0.0       # overlay fade (0..1)
+        self.cur = 0.0
+        self.vis = 0.0
         self.want_vis = 0.0
         self.phase = 0.0
 
-        self._arcs = []      # built once, updated every frame
+        self._arcs = []
         self._build_arcs()
         self.root.withdraw()
 
         threading.Thread(target=self._read_stdin, daemon=True).start()
         self._tick()
 
-    # ── setup ─────────────────────────────────────────────────────────────
 
     def _make_click_through(self):
         """Let all mouse input pass to whatever is underneath."""
         GWL_EXSTYLE       = -20
         WS_EX_LAYERED     = 0x00080000
         WS_EX_TRANSPARENT = 0x00000020
-        WS_EX_TOOLWINDOW  = 0x00000080   # hide from taskbar / Alt+Tab
+        WS_EX_TOOLWINDOW  = 0x00000080
         WS_EX_NOACTIVATE  = 0x08000000
         self.root.update_idletasks()
         hwnd = (ctypes.windll.user32.GetParent(self.root.winfo_id())
@@ -97,29 +93,19 @@ class Overlay:
         w, h = self.sw, self.sh
         cx, cy = w / 2, h / 2
 
-        # Half-extents: how far each arc stretches along the edge it decorates.
-        # Left/right arcs span vertically; top/bottom arcs span horizontally.
-        hy = h * SPAN_FRAC / 2   # vertical half-span (for left / right edges)
-        hx = w * SPAN_FRAC / 2   # horizontal half-span (for top / bottom edges)
+        hy = h * SPAN_FRAC / 2
+        hx = w * SPAN_FRAC / 2
 
         for i, depth in enumerate(_DEPTHS):
             cc = _CORE[i]
-            mc = _dim(cc, 0.50)   # mid glow
-            gc = _dim(cc, 0.14)   # outer haze
+            mc = _dim(cc, 0.50)
+            gc = _dim(cc, 0.14)
 
-            # Phase offset so ripple cascades outward from the screen edge
             ph = i * 0.36
 
-            # Threshold: outer arcs only appear at higher amplitude
             threshold = 0.03 + 0.40 * (i / (N_ARCS - 1))
 
-            # ── Angle conventions (Tkinter canvas: CCW from east=0°, y-axis down) ──
-            # • start=-90, extent=180  → right half of ellipse  (left edge arc)
-            # • start= 90, extent=180  → left  half of ellipse  (right edge arc)
-            # • start=  0, extent=180  → lower half on screen   (top  edge arc)
-            # • start=180, extent=180  → upper half on screen   (bottom edge arc)
 
-            # ── LEFT edge ─────────────────────────────────────────────────────────
             lbb = (-depth, cy - hy, depth, cy + hy)
             lg = self.canvas.create_arc(*lbb, start=-90, extent=180,
                                         style=tk.ARC, outline=gc, width=18, state="hidden")
@@ -128,7 +114,6 @@ class Overlay:
             lc = self.canvas.create_arc(*lbb, start=-90, extent=180,
                                         style=tk.ARC, outline=cc, width=2,  state="hidden")
 
-            # ── RIGHT edge ────────────────────────────────────────────────────────
             rbb = (w - depth, cy - hy, w + depth, cy + hy)
             rg = self.canvas.create_arc(*rbb, start=90, extent=180,
                                         style=tk.ARC, outline=gc, width=18, state="hidden")
@@ -137,7 +122,6 @@ class Overlay:
             rc = self.canvas.create_arc(*rbb, start=90, extent=180,
                                         style=tk.ARC, outline=cc, width=2,  state="hidden")
 
-            # ── TOP edge ──────────────────────────────────────────────────────────
             tbb = (cx - hx, -depth, cx + hx, depth)
             tg = self.canvas.create_arc(*tbb, start=0, extent=180,
                                         style=tk.ARC, outline=gc, width=18, state="hidden")
@@ -146,7 +130,6 @@ class Overlay:
             tc = self.canvas.create_arc(*tbb, start=0, extent=180,
                                         style=tk.ARC, outline=cc, width=2,  state="hidden")
 
-            # ── BOTTOM edge ───────────────────────────────────────────────────────
             bbb = (cx - hx, h - depth, cx + hx, h + depth)
             bg = self.canvas.create_arc(*bbb, start=180, extent=180,
                                         style=tk.ARC, outline=gc, width=18, state="hidden")
@@ -163,7 +146,6 @@ class Overlay:
                 "core":  (lc, rc, tc, bc),
             })
 
-    # ── runtime ───────────────────────────────────────────────────────────
 
     def _read_stdin(self):
         for line in sys.stdin:
@@ -185,9 +167,6 @@ class Overlay:
             if "show" in msg:
                 self.want_vis = 1.0 if msg["show"] else 0.0
 
-        # EOF means the Jarvis parent exited, including a native crash where its
-        # Python finally blocks cannot run. Do not leave an invisible pythonw.exe
-        # overlay process behind for every failed launch.
         try:
             self.root.after(0, self.root.destroy)
         except Exception:
@@ -206,24 +185,21 @@ class Overlay:
             self.root.attributes("-alpha", min(0.94 * self.vis, 0.94))
             self._draw()
 
-        self.root.after(16, self._tick)    # ~60 fps
+        self.root.after(16, self._tick)
 
     def _draw(self):
         level = self.cur * self.vis
         for arc in self._arcs:
-            # Cascade: subtract per-arc threshold so outer arcs need more signal.
             raw = max(0.0, level - arc["threshold"])
-            # Sine wobble gives the column a breathing / ripple feel.
             wobble = 0.55 + 0.45 * math.sin(self.phase + arc["phase"])
-            eff = min(raw * wobble * 2.2, 1.0)   # 2.2 = boost so arcs saturate crisply
+            eff = min(raw * wobble * 2.2, 1.0)
 
             visible = eff > 0.008
             state = "normal" if visible else "hidden"
 
-            # Line widths scale with effective amplitude.
-            hw = max(4,  min(22, int(20 * eff)))   # haze
-            mw = max(2,  min(10, int( 8 * eff)))   # mid glow
-            cw = max(1,  min(4,  int( 3 * eff)))   # bright core
+            hw = max(4,  min(22, int(20 * eff)))
+            mw = max(2,  min(10, int( 8 * eff)))
+            cw = max(1,  min(4,  int( 3 * eff)))
 
             for it in arc["haze"]:
                 self.canvas.itemconfigure(it, state=state, width=hw)

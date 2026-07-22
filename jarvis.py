@@ -7,7 +7,7 @@ import queue
 import re
 import sys
 import traceback
-import asyncio  # always needed (event loop for edge-tts)
+import asyncio
 import json
 import logging
 import math
@@ -39,19 +39,16 @@ try:
 except ImportError:
     ImageGrab = None
 
-# Google Calendar imports
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
-# edge-tts for fast responses (main for speed)
 try:
     import edge_tts
 except ImportError:
     edge_tts = None
 
-# Personal Telegram account integration (official MTProto client).
 try:
     from telethon import TelegramClient
     from telethon.errors import (
@@ -64,13 +61,8 @@ except ImportError:
     PasswordHashInvalidError = PhoneCodeExpiredError = PhoneCodeInvalidError = SessionPasswordNeededError = Exception
     telegram_display_name = None
 
-# === TTS CONFIG (speed first) ===
-# TTS_ENGINE=auto  → Piper when its model exists, otherwise edge-tts
-# TTS_ENGINE=edge  → Microsoft voice
-# TTS_ENGINE=xtts  → heavy Coqui XTTS with voice cloning (slow startup + generation)
 TTS_ENGINE = os.getenv("TTS_ENGINE", "auto").lower()
 
-# For XTTS only (lazy loaded)
 tts = None
 XTTS_DEVICE = None
 
@@ -84,7 +76,6 @@ def _load_xtts_if_needed():
         import torchaudio
         import soundfile as sf
 
-        # PyTorch 2.6+ fix
         _original_load = torch.load
         def _patched_load(*args, **kwargs):
             kwargs['weights_only'] = False
@@ -108,15 +99,10 @@ def _load_xtts_if_needed():
 command_queue = queue.Queue()
 pending_telegram_send = None
 
-# ─────────────────────────────────────────
-# Settings file
-# ─────────────────────────────────────────
 JARVIS_DIR = Path(__file__).parent
 CONFIG_PATH = JARVIS_DIR / "jarvis_config.json"
 APP_VERSION = "1.0.0"
 
-# Settings exposed in the desktop panel. API keys are write-only: the UI only
-# receives a boolean indicating whether a key exists.
 UI_SETTING_KEYS = {
     "JARVIS_LLM", "OLLAMA_MODEL", "OPENROUTER_MODEL", "STT_ENGINE",
     "WHISPER_MODEL", "TTS_ENGINE", "PIPER_VOICE", "EDGE_VOICE",
@@ -244,57 +230,25 @@ def _pythonw_exe() -> str:
     return str(noconsole if noconsole.exists() else exe)
 
 
-# Simple short-term conversation memory (last few turns)
 conversation_history = []
-MAX_HISTORY = 4  # keep last N messages for context (smaller prompt = faster first token)
+MAX_HISTORY = 4
 
-# Configurable via environment
-# deepseek-chat is a large, slow model — first token measured at 0.8-3.3s and the full
-# answer up to 13s. deepseek-v4-flash is the fast variant and the correct cloud default.
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-v4-flash")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
-# ─────────────────────────────────────────
-# LLM engine selection (speed contract: speech must start within LLM_DEADLINE)
-# ─────────────────────────────────────────
-# Measured on this machine (RTX 5070 Laptop):
-#   cloud deepseek-v4-flash : first token 0.6-4.2s  → cannot guarantee a deadline
-#   local  qwen2.5:3b       : first token ~0.45s    → reliably under 1.5s when kept warm
-# Local is therefore the default; cloud stays as automatic fallback.
-LLM_ENGINE = os.getenv("JARVIS_LLM", "local").lower()      # "local" | "cloud"
+LLM_ENGINE = os.getenv("JARVIS_LLM", "local").lower()
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
-# Hard budget for time-to-first-token. Exceeding it aborts the engine and fails over.
 LLM_DEADLINE = float(os.getenv("JARVIS_LLM_DEADLINE", "1.5"))
-# When a query is classified complex we deliberately want the stronger cloud
-# model, so its first-token deadline is generous — bailing to the weaker local
-# model at 1.5s would defeat the routing. Only used for the cloud engine.
 LLM_DEADLINE_CLOUD = float(os.getenv("JARVIS_LLM_DEADLINE_CLOUD", "9.0"))
-# Budget for the whole generation; we stop at the next sentence boundary past it so
-# the user never waits on a rambling answer. Speech has already started by then.
 LLM_GEN_BUDGET = float(os.getenv("JARVIS_LLM_GEN_BUDGET", "6.0"))
-# Time-to-first-token of the last call, surfaced in the UI latency chips.
 _last_llm_ttft_ms = 0.0
-# How many times an engine produced nothing and we failed over, cumulative per run.
-# A rising number means the local model is unhealthy — watch it in the log.
 _llm_empty_failovers = 0
 
-# For dangerous code confirmation
-# NOTE: voice-confirmation of dangerous code was deliberately removed (ROADMAP
-# §2.1). Safety is anti-wipe ONLY — see is_code_safe(). Do not revive a pending/
-# confirm pipeline here.
 
-# ─────────────────────────────────────────
-# Barge-in (speech interrupt) state
-# ─────────────────────────────────────────
-# Set to True while Jarvis is playing TTS audio
 _is_speaking = False
-# Epoch time after which mic is re-enabled (cooldown after Jarvis speaks)
 _speaking_cooldown_until = 0.0
-# Recognizer instance — set in run_assistant(); used by _set_done_speaking() to
-# cap energy_threshold after TTS so the user's voice isn't mistaken for silence.
 _recognizer = None
-# Signalled to True to interrupt ongoing playback immediately
 _interrupt_event = threading.Event()
 
 
@@ -303,12 +257,7 @@ def _set_done_speaking():
     global _is_speaking, _speaking_cooldown_until, _wake_active_until
     _is_speaking = False
     _speaking_cooldown_until = time.time() + SPEAK_COOLDOWN
-    # Conversation follow-up: for FOLLOWUP_WINDOW after Jarvis stops talking the
-    # user can just keep speaking — no wake word needed. Re-armed on every reply.
     _wake_active_until = (time.time() + FOLLOWUP_WINDOW) if FOLLOWUP_MODE != "off" else 0.0
-    # TTS audio leaks into the microphone and drives energy_threshold up via
-    # dynamic adaptation. Cap immediately so the user's voice isn't mistaken
-    # for silence on the very next utterance.
     if _recognizer is not None and _recognizer.energy_threshold > 1200:
         _recognizer.energy_threshold = 1200
         jarvis_logger.debug("[SPEAK] energy_threshold сброшен до 1200 после TTS")
@@ -316,9 +265,6 @@ def _set_done_speaking():
                         f"окно продолжения {FOLLOWUP_WINDOW:.0f} с")
 
 
-# ─────────────────────────────────────────
-# Logging setup (logs all interactions)
-# ─────────────────────────────────────────
 LOGS_DIR = JARVIS_DIR / "logs"
 LOGS_DIR.mkdir(exist_ok=True)
 log_filename = LOGS_DIR / f"jarvis_{datetime.datetime.now().strftime('%Y-%m-%d')}.log"
@@ -327,17 +273,14 @@ _log_fh.setLevel(logging.DEBUG)
 _log_fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-7s | %(message)s"))
 jarvis_logger = logging.getLogger("jarvis")
 jarvis_logger.setLevel(logging.DEBUG)
-if not jarvis_logger.handlers:   # guard against double-add on hot-reload
+if not jarvis_logger.handlers:
     jarvis_logger.addHandler(_log_fh)
-jarvis_logger.propagate = False  # don't duplicate to root logger
+jarvis_logger.propagate = False
 
 def log_interaction(role: str, text: str):
     """Log user commands and Jarvis replies to daily log file."""
     jarvis_logger.info(f"[{role.upper()}] {text}")
 
-# ─────────────────────────────────────────
-# Long-term personal memory (JSON)
-# ─────────────────────────────────────────
 MEMORY_FILE = JARVIS_DIR / "jarvis_memory.json"
 
 def load_memory() -> dict:
@@ -376,9 +319,6 @@ def recall(key: str = None) -> str:
     items = "; ".join(f"{k}: {v}" for k, v in list(mem.items())[:10])
     return f"Вот что я помню: {items}."
 
-# ─────────────────────────────────────────
-# To-Do list (JSON)
-# ─────────────────────────────────────────
 TODO_FILE = JARVIS_DIR / "jarvis_todo.json"
 
 def load_todo() -> list:
@@ -415,17 +355,11 @@ def todo_done(n: int) -> str:
     items = load_todo()
     pending = [i for i in items if not i["done"]]
     if 1 <= n <= len(pending):
-        # `pending` contains the same dict objects as `items`, so changing this
-        # one item is enough. Matching again by task text used to mark every
-        # duplicate task as done at once.
         pending[n-1]["done"] = True
         save_todo(items)
         return f"Готово: {pending[n-1]['task']}"
     return "Такого пункта нет в списке."
 
-# ─────────────────────────────────────────
-# Timer / Alarm
-# ─────────────────────────────────────────
 _active_timers: list = []
 
 def set_timer(seconds: int, label: str = "", speak_fn=None):
@@ -446,8 +380,6 @@ def parse_timer_duration(text: str) -> int | None:
     if re.search(r'(?<!\w)полчаса(?!\w)', text):
         return 1800
 
-    # Whisper often returns spoken numbers as words. Normalize the common
-    # 1..60 range before applying the compact numeric parser below.
     number_words = {
         "шестьдесят": 60, "пятьдесят": 50, "сорок": 40, "тридцать": 30,
         "двадцать": 20, "девятнадцать": 19, "восемнадцать": 18,
@@ -479,9 +411,6 @@ def parse_timer_duration(text: str) -> int | None:
     if m: total += int(m.group(1))
     return total if total > 0 else None
 
-# ─────────────────────────────────────────
-# Weather (wttr.in — no API key needed!)
-# ─────────────────────────────────────────
 def get_weather(city: str = "Moscow") -> str:
     """Get weather using wttr.in (free, no API key)."""
     try:
@@ -505,8 +434,6 @@ def handle_local_productivity_command(text: str, speak_fn=None) -> str | None:
     if not t:
         return None
 
-    # Weather: accept concise command shapes, not arbitrary mentions such as
-    # "прогноз погоды в сериале".
     weather = re.fullmatch(
         r'(?:(?:скажи|покажи)\s+)?(?:какая\s+)?(?:сейчас\s+)?'
         r'(?:погода|прогноз погоды)(?:\s+(?:в|для)\s+(.+?))?'
@@ -517,7 +444,6 @@ def handle_local_productivity_command(text: str, speak_fn=None) -> str | None:
                 "петербурге": "Санкт-Петербург"}.get(city, city)
         return get_weather(city)
 
-    # Timer.
     if re.match(r'^(?:(?:поставь|запусти|установи)\s+)?таймер\b', t):
         seconds = parse_timer_duration(t)
         if not seconds:
@@ -533,8 +459,6 @@ def handle_local_productivity_command(text: str, speak_fn=None) -> str | None:
         if secs: parts.append(f"{secs} сек")
         return f"Таймер на {' '.join(parts)} запущен, сэр."
 
-    # Personal memory. Store free-form notes under a timestamp key so repeated
-    # "запомни" commands never overwrite one another.
     remember_match = re.match(r'^(?:запомни|сохрани в память)\s+(.+)$', t)
     if remember_match:
         fact = remember_match.group(1).strip()
@@ -544,7 +468,6 @@ def handle_local_productivity_command(text: str, speak_fn=None) -> str | None:
     if re.fullmatch(r'(?:что ты помнишь|покажи память|что у тебя в памяти|вспомни обо мне)', t):
         return recall()
 
-    # To-do operations.
     done_match = re.fullmatch(
         r'(?:(?:отметь|закрой)\s+)?(?:задачу|пункт)\s+(\d+)\s+'
         r'(?:выполненной|выполненным|готово)', t)
@@ -566,9 +489,6 @@ def handle_local_productivity_command(text: str, speak_fn=None) -> str | None:
 
     return None
 
-# ─────────────────────────────────────────
-# System Monitoring (psutil)
-# ─────────────────────────────────────────
 def get_system_stats() -> str:
     """Get CPU, RAM, disk stats."""
     try:
@@ -586,9 +506,6 @@ def get_system_stats() -> str:
     except Exception as e:
         return f"Ошибка мониторинга: {e}"
 
-# ─────────────────────────────────────────
-# Screenshot
-# ─────────────────────────────────────────
 def take_screenshot() -> str:
     """Take a screenshot and save to Screenshots folder."""
     try:
@@ -597,7 +514,6 @@ def take_screenshot() -> str:
         ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         filepath = screenshots_dir / f"screenshot_{ts}.png"
 
-        # pyautogui is more reliable on Windows (handles DPI scaling)
         try:
             import pyautogui as _pag
             _pag.screenshot(str(filepath))
@@ -613,9 +529,6 @@ def take_screenshot() -> str:
         return f"Ошибка скриншота: {e}"
 
 
-# ─────────────────────────────────────────
-# Lock PC
-# ─────────────────────────────────────────
 def lock_pc() -> str:
     """Lock the Windows workstation."""
     try:
@@ -624,9 +537,6 @@ def lock_pc() -> str:
     except Exception as e:
         return f"Ошибка блокировки: {e}"
 
-# ─────────────────────────────────────────
-# Brightness Control
-# ─────────────────────────────────────────
 def set_brightness(level: int) -> str:
     """Set screen brightness (0-100)."""
     if sbc is None:
@@ -638,82 +548,41 @@ def set_brightness(level: int) -> str:
     except Exception as e:
         return f"Ошибка яркости: {e}"
 
-# === Obsidian memory cache (avoid re-reading every request) ===
 _obsidian_cache = None
 _obsidian_cache_time = 0
-OBSIDIAN_CACHE_TTL = 120  # refresh every 2 minutes
+OBSIDIAN_CACHE_TTL = 120
 
-# === Wake-word matching ===
-# Whisper rarely returns a clean "Джарвис". On this user's own voice the `base`
-# model transcribed it as "Жар весь", so an exact match never fired and Jarvis
-# appeared deaf. We match phonetic variants instead of the literal string.
 WAKE_CANON = ("джарвис", "jarvis")
-# Anchored to a whole token, so "сервис" (0.62) / "марвел" (0.46) can't trigger it.
 WAKE_VARIANT_RE = re.compile(
     r"^(?:дж|ж|ч|щ|д|ш|х|з|тр)[аоуяею]р?[вб][еиыія][сзц]ь?$"
     r"|^(?:ярвис|арвис|ярвись)$"
     r"|^(?:jarvis|travis|djarvis|jarvis|harvey)$",
     re.UNICODE,
 )
-# Catch-all for variants the pattern misses.
 WAKE_FUZZY_THRESHOLD = 0.72
 
-# Ordinary words that score at/above the threshold and must never wake Jarvis.
-# These CANNOT be excluded by raising WAKE_FUZZY_THRESHOLD: "дарвин" scores 0.769
-# and so does the genuine mis-hearing "жарвес" — identical, so no threshold
-# separates them. (The old comment here claimed 0.72 was calibrated against
-# "нарвись" at 0.71 and that "дарвин" was safe; "дарвин" was never checked and
-# does fire.) "давись" additionally matches WAKE_VARIANT_RE outright, since
-# д-а-в-и-с-ь fits the phonetic pattern exactly — hence the blocklist is checked
-# before both mechanisms, not just the fuzzy one.
-# Keep this list to genuine everyday words. Near-neighbours like "парвис" /
-# "харвис" / "джарси" also score 0.769 but are far likelier to be Whisper
-# mangling "Джарвис" than words the user actually said — leave those matching.
 WAKE_BLOCKLIST = frozenset({"дарвин", "давись"})
 
-# ── Listening timings ───────────────────────────────────────────────────────
-# Silence that marks the end of a phrase. This was 0.4s and cut the user off
-# mid-sentence: any breath or thinking pause closed the phrase and Jarvis
-# answered half a question. It also made a bare "Джарвис" register instantly, so
-# he barged in with "Слушаю, сэр" while the user was still drawing breath.
-# Higher = he waits for you to finish, and every command costs that much latency.
-# 1.8s still split questions when the user paused to choose words. 2.6s is the
-# reliability-first default; local commands recover most of the perceived delay.
 PAUSE_THRESHOLD = float(os.getenv("JARVIS_PAUSE_THRESHOLD", "2.6"))
 
-# How long to ignore the mic after Jarvis finishes speaking. Prevents self-
-# hearing: the speaker output leaks into the microphone and would otherwise
-# be transcribed as a command. 1.5 s covers most room echo; raise if the
-# listener is still triggering on Jarvis's own voice.
 SPEAK_COOLDOWN = float(os.getenv("JARVIS_SPEAK_COOLDOWN", "1.5"))
 
-# A bare wake word opens this window without speaking back. The old immediate
-# "Слушаю, сэр" response played over the beginning of the user's next phrase,
-# and the self-hearing guard then discarded that phrase.
 WAKE_COMMAND_WINDOW = float(os.getenv("JARVIS_WAKE_COMMAND_WINDOW", "10.0"))
 
-# Long dictation/code questions must not be force-cut at the old 25-second cap.
 PHRASE_TIME_LIMIT = float(os.getenv("JARVIS_PHRASE_TIME_LIMIT", "45.0"))
 
-# After Jarvis finishes speaking, keep accepting commands for this long WITHOUT
-# the wake word (conversation follow-up). Re-armed on every reply, so a running
-# back-and-forth never needs "Джарвис" again.
 FOLLOWUP_WINDOW = float(os.getenv("JARVIS_FOLLOWUP_WINDOW", "15.0"))
 FOLLOWUP_MODE = os.getenv("JARVIS_FOLLOWUP_MODE", "strict").lower()
 if FOLLOWUP_MODE not in {"strict", "normal", "off"}:
     FOLLOWUP_MODE = "strict"
 
-# Last spoken reply, used to reject speaker echo in the follow-up window.
 _last_spoken_text = ""
 
-# Interjections that are never a command. Inside the follow-up window there is no
-# wake word to lean on, so a stray "ага" to someone else would otherwise wake him.
 _BACKCHANNEL = frozenset({
     "ага", "угу", "ну", "хм", "хмм", "мм", "ммм", "эм", "э", "а", "ой",
     "мгм", "да-да", "ага-ага", "тс", "ш", "вот", "это", "так",
 })
 
-# faster-whisper invents these on silence/noise — a known artifact, not speech.
 _WHISPER_GHOST_RE = re.compile(
     r"(продолжение следует|субтитр|спасибо за просмотр|редактор субтитров|"
     r"корректор|dimatorzok|подписывайтесь на канал|игорь негода)",
@@ -738,7 +607,7 @@ def _is_stray_speech(text: str) -> bool:
         return True
     if t in _BACKCHANNEL:
         return True
-    if len(t) <= 2:          # "а", "э", clicks picked up as letters
+    if len(t) <= 2:
         return True
     if _last_spoken_text:
         heard = re.sub(r'\W+', ' ', t, flags=re.UNICODE).strip()
@@ -751,7 +620,6 @@ def _is_stray_speech(text: str) -> bool:
             if ratio >= 0.58 or (len(heard_words) >= 3 and overlap >= 0.72):
                 return True
     if FOLLOWUP_MODE == "strict":
-        # Without a wake word, only clear command/question shapes are accepted.
         if not re.search(
             r'\b(открой|запусти|включи|выключи|покажи|скажи|расскажи|объясни|'
             r'найди|сделай|поставь|добавь|запомни|напомни|напиши|проверь|прочитай|'
@@ -760,31 +628,15 @@ def _is_stray_speech(text: str) -> bool:
             return True
     return False
 
-# ─────────────────────────────────────────
-# Intent fallback: detect action requests even if LLM forgot the tag
-# ─────────────────────────────────────────
 INTENT_PATTERNS = [
-    # Browser
     (re.compile(r'\b(открой|запусти|включи)\b.{0,20}\b(браузер|хром|chrome|интернет|гугл|google)\b', re.IGNORECASE | re.UNICODE), 'OPEN:browser'),
-    # NOTE: a bare `\b(браузер|хром|chrome)\b` pattern used to live here. It had no
-    # verb, so simply *mentioning* a browser launched one — "какой браузер лучше",
-    # "почему chrome жрёт память" and "расскажи про браузер" all opened Chrome.
-    # The verb-qualified pattern above already covers every real command.
-    # Claude
     (re.compile(r'\b(открой|запусти).{0,20}(клод|claude)\b', re.IGNORECASE | re.UNICODE), 'OPEN:claude'),
-    # Telegram
     (re.compile(r'\b(открой|запусти).{0,20}(телеграм|телега|telegram)\b', re.IGNORECASE | re.UNICODE), 'OPEN:telegram'),
-    # Discord
     (re.compile(r'\b(открой|запусти).{0,20}(дискорд|discord)\b', re.IGNORECASE | re.UNICODE), 'OPEN:discord'),
-    # VS Code
     (re.compile(r'\b(открой|запусти).{0,20}(vs code|vscode|код|code)\b', re.IGNORECASE | re.UNICODE), 'OPEN:vscode'),
-    # Obsidian
     (re.compile(r'\b(открой|запусти).{0,20}(обсидиан|obsidian|заметки)\b', re.IGNORECASE | re.UNICODE), 'OPEN:obsidian'),
-    # Notepad
     (re.compile(r'\b(открой|запусти).{0,20}(блокнот|notepad|записную)\b', re.IGNORECASE | re.UNICODE), 'OPEN:notepad'),
-    # Calculator
     (re.compile(r'\b(открой|запусти).{0,20}(калькулятор|calc)\b', re.IGNORECASE | re.UNICODE), 'OPEN:calc'),
-    # Music
     (re.compile(r'\b(включи|поставь|запусти|открой).{0,30}(музыку|яндекс.музык|yandex.music)\b', re.IGNORECASE | re.UNICODE), 'MUSIC:OPEN'),
     (re.compile(r'\b(включи|поставь|запусти).{0,20}(волну|мою волну)\b', re.IGNORECASE | re.UNICODE), 'MUSIC:PLAY:мою волну'),
 ]
@@ -871,18 +723,9 @@ def detect_telegram_intent_from_text(text: str) -> str | None:
     return None
 
 
-# ─────────────────────────────────────────
-# TTS
-# ─────────────────────────────────────────
-# Precomputed TTS cache for instant common responses.
-# Maps phrase -> path of a pre-generated audio file on disk.
-# Generated once at startup (and persisted between runs), so these phrases
-# play with ~0ms generation latency instead of a ~650ms edge-tts round-trip.
 _TTS_INSTANT_CACHE: dict[str, str] = {}
 _TTS_CACHE_DIR = JARVIS_DIR / "tts_cache"
 
-# Phrases Jarvis says constantly — acknowledgements, greetings, confirmations.
-# Keep them short; these are the ones that must feel instant.
 INSTANT_PHRASES = [
     "Слушаю, сэр.",
     "Слушаю.",
@@ -925,16 +768,10 @@ def prewarm_tts_cache():
         _TTS_CACHE_DIR.mkdir(exist_ok=True)
     except Exception:
         return
-    # Tag cache files by TTS_ENGINE so they're regenerated when the engine changes.
-    engine = effective   # must match tts_to_bytes() priority
+    engine = effective
     for phrase in INSTANT_PHRASES:
         import hashlib
         h = hashlib.md5(f"{engine}:{phrase}".encode("utf-8")).hexdigest()[:12]
-        # The extension must match the engine, not merely the hash. Globbing for
-        # "{h}.*" accepted a piper .wav that had been written under an "edge:" key
-        # back when tts_to_bytes still fell back to piper — so "Тише, сэр." kept
-        # playing in piper's voice while every other phrase used edge. Anything
-        # with our hash but the wrong extension is that artifact: drop it.
         existing = _TTS_CACHE_DIR / f"{h}.{_cache_ext()}"
         if existing.exists():
             _TTS_INSTANT_CACHE[phrase] = str(existing)
@@ -956,11 +793,6 @@ def prewarm_tts_cache():
                 continue
 
 
-# ─────────────────────────────────────────
-# Screen-edge voice visualiser (overlay.py, separate process)
-# ─────────────────────────────────────────
-# Shown only while Jarvis speaks *and* the main window is minimised, so you can
-# see him talking without the window in front of you.
 OVERLAY_ENABLED = os.getenv("JARVIS_OVERLAY", "on").lower() == "on"
 _overlay_proc = None
 _overlay_lock = threading.Lock()
@@ -1019,7 +851,7 @@ def _main_window_minimized() -> bool:
     the orb already shows Jarvis speaking.
     """
     if _ui_window is None:
-        return True          # console mode: no window at all, always show bars
+        return True
     try:
         hwnd = ctypes.windll.user32.FindWindowW(None, "J.A.R.V.I.S.")
         if not hwnd:
@@ -1051,8 +883,6 @@ def _wav_envelope(data: bytes, fps: int = 60):
             return None
         frames = samples[:n * hop].reshape(n, hop)
         rms = np.sqrt((frames ** 2).mean(axis=1))
-        # Speech RMS is tiny and spiky; compress it so quiet syllables still move
-        # the bars, then normalise against this clip's own peak.
         env = rms ** 0.55
         peak = env.max()
         if peak <= 1e-6:
@@ -1078,11 +908,10 @@ def _playback_pump(env, fps: int = 60) -> bool:
                 return False
             if show:
                 if env:
-                    pos = pygame.mixer.music.get_pos()      # ms since play()
+                    pos = pygame.mixer.music.get_pos()
                     i = int(pos / 1000.0 * fps) if pos >= 0 else 0
                     amp = env[i] if 0 <= i < len(env) else 0.0
                 else:
-                    # No envelope (mp3 fallback): keep the bars alive but generic.
                     amp = 0.45 + 0.25 * math.sin(time.perf_counter() * 9.0)
                 _overlay_send(amp=amp)
             clock.tick(fps)
@@ -1121,23 +950,18 @@ def _play_cached_file(path: str) -> bool:
 def _clean_tts_text(text: str) -> str:
     """Strip emoji and special unicode that cause edge-tts to fail silently."""
     import unicodedata
-    # Remove emoji and other non-speech unicode categories
     cleaned = []
     for ch in text:
         cat = unicodedata.category(ch)
-        # Keep: letters (L*), numbers (N*), punctuation (P*), spaces (Zs), marks (M*)
-        # Drop: symbols (S*) which includes emoji, math symbols, currency etc.
         if cat.startswith('S'):
             cleaned.append(' ')
         else:
             cleaned.append(ch)
     result = ''.join(cleaned)
-    # Collapse multiple spaces
     result = re.sub(r'  +', ' ', result).strip()
     return result
 
 
-# The edge-tts voice. Was duplicated as a literal in both edge functions below.
 EDGE_VOICE = os.getenv("EDGE_VOICE", "ru-RU-DmitryNeural")
 
 
@@ -1158,8 +982,6 @@ def _run_edge_tts_sync(text: str, output: str) -> bool:
         jarvis_logger.error(f"[TTS:edge] save failed: {e}")
         return False
     finally:
-        # Was only closed on the success path: every network failure leaked a
-        # loop and its sockets for the lifetime of the process.
         if loop is not None:
             loop.close()
             asyncio.set_event_loop(None)
@@ -1190,25 +1012,14 @@ def _edge_tts_to_bytes(text: str) -> bytes | None:
         print(f"edge-tts bytes error: {e}")
         return None
     finally:
-        # See _run_edge_tts_sync: the close was on the success path only.
         if loop is not None:
             loop.close()
             asyncio.set_event_loop(None)
 
 
-# ─────────────────────────────────────────
-# Piper — LOCAL neural TTS (fast, offline, no network round-trip)
-# ~170ms for a full sentence vs ~650-1400ms for cloud edge-tts.
-# Automatically preferred whenever the voice model is present.
-# ─────────────────────────────────────────
-# Override with PIPER_MODEL to use a faster 'low'-quality voice (~2x faster synth).
-# Voice selection. PIPER_VOICE picks one of the models in piper_models/ by name
-# (dmitri / ruslan / denis / irina); PIPER_MODEL overrides with an explicit path.
 PIPER_VOICE = os.getenv("PIPER_VOICE", "dmitri")
 PIPER_MODEL_PATH = Path(os.getenv(
     "PIPER_MODEL", str(JARVIS_DIR / "piper_models" / f"ru_RU-{PIPER_VOICE}-medium.onnx")))
-# How fast the voice speaks. >1 slower/clearer, <1 faster. Piper's default (1.0)
-# sounds rushed and clipped in Russian, which reads as "a strange voice".
 PIPER_LENGTH_SCALE = float(os.getenv("PIPER_LENGTH_SCALE", "1.0"))
 _piper_voice = None
 _piper_tried = False
@@ -1301,8 +1112,6 @@ def tts_to_bytes(text: str):
             jarvis_logger.debug(f"[TTS:edge] {_last_tts_ms:.0f} ms: {text[:50]!r}")
             return data, ".mp3"
         jarvis_logger.warning(f"[TTS:edge] FAILED (сеть?): {text[:60]!r}")
-    # Piper fallback only when TTS_ENGINE is NOT "edge".
-    # Switching voice mid-sentence is worse than silence.
     if engine not in {"edge", "piper"} and _piper_available():
         data = _piper_to_wav_bytes(text)
         if data:
@@ -1329,7 +1138,6 @@ def generate_speech(text: str) -> bool:
         output = "temp_jarvis_speech.mp3"
         return _run_edge_tts_sync(text, output)
 
-    # XTTS path (slow, use only if TTS_ENGINE=xtts)
     _load_xtts_if_needed()
     if tts is None:
         print("TTS not available.")
@@ -1345,7 +1153,6 @@ def generate_speech(text: str) -> bool:
 
     try:
         tts.tts_to_file(text=text, speaker_wav=reference_audio, language="ru", file_path=output_audio_raw)
-        # Optional speed-up (can be removed for max speed)
         subprocess.run(
             ['ffmpeg', '-y', '-i', output_audio_raw, '-filter:a', 'atempo=1.3', output_audio],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
@@ -1363,7 +1170,6 @@ def _play_audio_bytes(data: bytes, suffix: str = ".mp3") -> bool:
     try:
         if not pygame.mixer.get_init():
             pygame.mixer.init()
-        # Write to named temp file (pygame needs a seekable file)
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
             f.write(data)
             tmp = f.name
@@ -1394,19 +1200,16 @@ def speak(text: str):
     print(f"Jarvis: {text}")
     jarvis_logger.info(f"[SPEAK] {text!r}")
 
-    # UI: show "speaking" on the orb + add Jarvis's reply to the transcript
     ui_state("speaking")
-    if text.strip() != "Секунду, обрабатываю, сэр.":   # skip the filler
+    if text.strip() != "Секунду, обрабатываю, сэр.":
         ui_msg("jarvis", text)
 
-    # Instant path: pre-generated cache file → ~0ms generation latency.
     cached = _TTS_INSTANT_CACHE.get(text.strip())
     if cached and os.path.exists(cached):
         jarvis_logger.debug("[SPEAK] → instant cache")
         _play_cached_file(cached)
         return
 
-    # Fast path: local piper (or edge fallback) → play from memory bytes.
     if _effective_tts_engine() in {"piper", "edge"}:
         data, suffix = tts_to_bytes(text)
         if data:
@@ -1415,7 +1218,6 @@ def speak(text: str):
             _play_audio_bytes(data, suffix)
             _set_done_speaking()
             return
-        # if both engines failed, fall through to legacy path below
 
     success = generate_speech(text)
     if not success:
@@ -1428,19 +1230,17 @@ def speak(text: str):
         audio_file = "temp_jarvis_speech.mp3" if _effective_tts_engine() == "edge" else "temp_jarvis_speech.wav"
         pygame.mixer.music.load(audio_file)
 
-        # Clear any leftover interrupt signal, mark as speaking
         _interrupt_event.clear()
         _is_speaking = True
 
         pygame.mixer.music.play()
 
-        # Poll in tight loop — stops the moment _interrupt_event is set
         while pygame.mixer.music.get_busy():
             if _interrupt_event.is_set():
                 pygame.mixer.music.stop()
                 print("[Прерывание TTS]")
                 break
-            pygame.time.Clock().tick(30)  # 30 FPS poll ≈ 33ms max latency
+            pygame.time.Clock().tick(30)
 
         _set_done_speaking()
 
@@ -1468,7 +1268,6 @@ def speak_streaming(sentences_iter):
 
     jarvis_logger.info("[SPEAK:stream] start")
     if not (_piper_available() or edge_tts is not None):
-        # Fallback: collect all and speak normally
         full = " ".join(sentences_iter)
         speak(full)
         return
@@ -1481,7 +1280,6 @@ def speak_streaming(sentences_iter):
         """Background thread: converts each sentence to (bytes, suffix) and enqueues."""
         for sentence in sentences_iter:
             sentence = sentence.strip()
-            # Skip empty strings or strings with only punctuation (TTS engines crash otherwise)
             if not sentence or not re.search(r'[A-Za-zА-Яа-я0-9]', sentence):
                 continue
             if _interrupt_event.is_set():
@@ -1513,7 +1311,7 @@ def speak_streaming(sentences_iter):
                 break
             data, suffix = item
             completed = _play_audio_bytes(data, suffix)
-            if not completed:  # barge-in happened mid-sentence
+            if not completed:
                 break
     finally:
         if spoken_parts:
@@ -1524,9 +1322,6 @@ def speak_streaming(sentences_iter):
 
 
 
-# ─────────────────────────────────────────
-# Media & Volume Controls
-# ─────────────────────────────────────────
 def set_volume(level: int):
     """Set system volume level (0-100)."""
     try:
@@ -1535,10 +1330,8 @@ def set_volume(level: int):
             IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
         volume = cast(interface, POINTER(IAudioEndpointVolume))
         
-        # Ensure level is between 0 and 100
         level = max(0, min(100, level))
         
-        # Scalar is 0.0 to 1.0
         scalar = level / 100.0
         volume.SetMasterVolumeLevelScalar(scalar, None)
         print(f"Volume set to {level}%")
@@ -1578,9 +1371,6 @@ def media_control(action: str):
     else:
         print(f"Unknown media action: {action}")
 
-# ─────────────────────────────────────────
-# Web Search
-# ─────────────────────────────────────────
 def search_web(query: str) -> str:
     """Search DuckDuckGo and return the first result snippet."""
     print(f"Ищу в интернете: {query}")
@@ -1595,26 +1385,19 @@ def search_web(query: str) -> str:
         print(f"Search error: {e}")
         return "Произошла ошибка при поиске в сети."
 
-# ─────────────────────────────────────────
-# Ghost Writer (Typing)
-# ─────────────────────────────────────────
 def type_text(text: str):
     """Type text into the active window using the clipboard to support Russian."""
     print(f"Печатаю текст: {text}")
     try:
         original_clipboard = pyperclip.paste()
         pyperclip.copy(text)
-        time.sleep(0.1) # short delay to ensure focus
-        # Ctrl+V
+        time.sleep(0.1)
         pyautogui.hotkey('ctrl', 'v')
         time.sleep(0.1)
         pyperclip.copy(original_clipboard)
     except Exception as e:
         print(f"Ghost Writer error: {e}")
 
-# ─────────────────────────────────────────
-# Google Calendar Integration
-# ─────────────────────────────────────────
 SCOPES = ['https://www.googleapis.com/auth/calendar']
 
 def get_calendar_service():
@@ -1646,7 +1429,6 @@ def read_calendar_events(timeframe: str = "сегодня") -> str:
         return "Необходима авторизация. Положите файл credentials.json в папку."
     
     now = datetime.datetime.utcnow().isoformat() + 'Z'
-    # Define end of day
     end_of_day = (datetime.datetime.utcnow().replace(hour=23, minute=59, second=59)).isoformat() + 'Z'
     
     try:
@@ -1661,7 +1443,6 @@ def read_calendar_events(timeframe: str = "сегодня") -> str:
         resp = "Вот ваши события на сегодня: "
         for event in events:
             start = event['start'].get('dateTime', event['start'].get('date'))
-            # Simplify time string if it contains T
             if 'T' in start:
                 time_str = start.split('T')[1][:5]
                 resp += f"В {time_str} — {event['summary']}. "
@@ -1689,7 +1470,7 @@ def add_calendar_event(time_str: str, summary: str) -> str:
             'timeZone': 'Europe/Moscow',
           },
           'end': {
-            'dateTime': start_dt, # Quick events can have same start/end
+            'dateTime': start_dt,
             'timeZone': 'Europe/Moscow',
           },
         }
@@ -1701,9 +1482,6 @@ def add_calendar_event(time_str: str, summary: str) -> str:
         return "Не удалось добавить событие. Убедитесь, что время в формате ЧЧ:ММ."
 
 
-# ─────────────────────────────────────────
-# Personal Telegram account (Telethon / official MTProto API)
-# ─────────────────────────────────────────
 TELEGRAM_DATA_DIR = JARVIS_DIR / "telegram_data"
 TELEGRAM_SESSION_BASE = TELEGRAM_DATA_DIR / "jarvis_user"
 TELEGRAM_EXPORT_DIR = Path.home() / "Documents" / "Jarvis Telegram Exports"
@@ -2055,9 +1833,6 @@ def telegram_confirm_pending(text: str) -> str | None:
         return telegram_send_message(payload["chat"], payload["text"])
     return "Ожидаю подтверждения отправки Telegram: скажите «подтверждаю» или «отмена»."
 
-# ─────────────────────────────────────────
-# System Actions
-# ─────────────────────────────────────────
 _app_catalog_cache = None
 _app_catalog_time = 0.0
 
@@ -2134,10 +1909,6 @@ _APP_ALIASES = {
 }
 
 
-# Names that sound like applications but are actually web services. Passing a
-# bare value such as ``youtube`` to ``cmd /c start`` makes Windows show a modal
-# "Не удаётся найти" dialog while the parent process still reports success.
-# Resolve these names to real URLs before consulting the installed-app catalog.
 _WEB_TARGETS = {
     "youtube": "https://www.youtube.com/",
     "ютуб": "https://www.youtube.com/",
@@ -2183,7 +1954,6 @@ def resolve_app(query: str) -> dict | None:
             score = 0.92 - abs(len(name) - len(norm)) * 0.005
         else:
             score = SequenceMatcher(None, norm, name).ratio()
-        # Prefer actual app names over helpers/uninstallers with similar names.
         penalty = 0.18 if re.search(r'\b(uninstall|helper|update|manual|docs?)\b', name) else 0.0
         candidates.append((score - penalty, item))
     if not candidates:
@@ -2200,7 +1970,6 @@ def extract_open_app_request(text: str) -> str | None:
     if not match:
         return None
     query = match.group(1).strip(' .,!?:;')
-    # Dedicated routes retain their special behavior.
     if re.search(r'\b(?:музык\w*|волн\w*|песн\w*|трек\w*)\b', query, re.UNICODE):
         return None
     if query.startswith("сайт ") or re.match(r'^(?:https?://|www\.|\S+\.(?:ru|com|org|net|io)\b)', query):
@@ -2245,7 +2014,6 @@ def execute_system_command(cmd: str) -> bool:
             return True
         except Exception as e:
             print(f"[execute_system_command] Error opening {cmd}: {e}")
-            # Fallback to shell start if direct execution fails
             try:
                 os.startfile(path)
                 return True
@@ -2262,16 +2030,7 @@ def execute_system_command(cmd: str) -> bool:
                 return True
             except Exception as e:
                 jarvis_logger.warning(f"[APPS] launch failed {resolved['target']!r}: {e}")
-        # URLs, explicit paths and executables on PATH are safe deterministic
-        # fallbacks. Do not pass an unresolved bare word to ``cmd /c start``:
-        # Windows reports that process as launched successfully and then shows a
-        # modal "Не удаётся найти '<word>'" dialog, so Jarvis falsely says that it
-        # opened the target (the exact failure seen with "открой youtube").
         try:
-            # Treat as URL if it already has a scheme, or looks like domain.tld —
-            # at least one dot, no spaces, no path separator at start, valid TLD length.
-            # This catches .id, .gg, .ai, .io, .to and every other ccTLD without
-            # maintaining a whitelist that has to be extended for every new domain.
             _is_url = (
                 cmd.startswith(("http://", "https://")) or (
                     " " not in cmd and
@@ -2316,10 +2075,6 @@ def run_shell_command(cmd: str) -> str:
     if not cmd:
         return "Пустая команда, сэр."
 
-    # Intercept Unix-style `open <target>` — no such cmdlet exists on Windows,
-    # so PowerShell can NEVER run it; falling through only produces the error.
-    # Delegate to execute_system_command, which resolves URLs (any TLD),
-    # app_paths aliases ("browser"), the installed-app catalog, and PATH exes.
     _open_m = re.match(r'^open\s+(.+)$', cmd, re.IGNORECASE)
     if _open_m:
         _target = _open_m.group(1).strip().strip('"\'')
@@ -2339,9 +2094,6 @@ def run_shell_command(cmd: str) -> str:
         jarvis_logger.warning(f"[ANTI-WIPE] заблокирована команда: {reason} :: {cmd[:120]!r}")
         return "Не могу трогать систему или удалять проекты, сэр."
     try:
-        # PowerShell 5.1 writes redirected output in the OEM codepage, not UTF-8,
-        # so Cyrillic output would come back as mojibake. Force the pipe to UTF-8
-        # from inside the command and decode it as UTF-8 on our side.
         proc = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command",
              "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; " + cmd],
@@ -2356,9 +2108,6 @@ def run_shell_command(cmd: str) -> str:
             if not out:
                 return "Готово, сэр."
             return "Готово, сэр. " + (out if len(out) <= 300 else out[:300] + "…")
-        # Do NOT read the raw stderr aloud. A PowerShell error dump took ~6 s of
-        # TTS, and its echo through the speakers then re-entered the mic as a
-        # "command". Speak one compact line; the full text is already in the log.
         first_err = (err or out).splitlines()[0].strip() if (err or out) else ""
         if len(first_err) > 90:
             first_err = first_err[:90] + "…"
@@ -2394,9 +2143,6 @@ def play_yandex_music(query: str, auto_play: bool = True):
         def _auto_play():
             try:
                 time.sleep(6)
-                # Avoid the old blind centre-screen click: it could activate or
-                # press buttons in an unrelated foreground window. A media key is
-                # global and harmless if the browser is not ready yet.
                 pyautogui.press('playpause')
                 jarvis_logger.info("[MUSIC] sent global play/pause media key")
             except Exception as e:
@@ -2438,9 +2184,6 @@ def get_jarvis_status() -> tuple[str, dict]:
     return spoken, data
 
 
-# ─────────────────────────────────────────
-# Safety filter for EXECUTE_PYTHON
-# ─────────────────────────────────────────
 def _protected_roots() -> list:
     """Lowercased, backslash-normalised paths whose recursive deletion is blocked.
 
@@ -2478,44 +2221,30 @@ def is_code_safe(code: str) -> tuple[bool, str]:
     low = code.lower()
     norm = low.replace("/", "\\")
 
-    # Disk / boot wipe utilities. `format` only as a disk command (format C:),
-    # never str.format(...).
     if re.search(r"\bdiskpart\b", low) or re.search(r"\bbcdedit\b", low):
         return False, "diskpart/bcdedit — снос диска или загрузчика"
     if re.search(r"\bformat\s+(?:/\S+\s+)*[a-z]:", low):
         return False, "format диска"
 
-    # Destructive system registry hives (HKLM\SYSTEM etc.).
     if (re.search(r"reg\s+delete\s+[^\n]*(?:hklm|hkey_local_machine)\\system", low)
             or re.search(r"remove-item\s+[^\n]*hklm:\\system", low)):
         return False, "удаление системного куста реестра"
 
-    # Recursive / mass delete verbs.
     destructive = bool(re.search(
         r"shutil\.rmtree|\brmtree\b|\brm\s+-[rf]{1,2}\b|\brd\s+/s|\bdel\s+/s|"
         r"remove-item\b[^\n]*-recurse|os\.removedirs", low))
 
-    # Wiping a whole drive root: rmtree("C:\\"), Remove-Item C:\ -Recurse.
-    # Done in plain Python — a "drive letter, colon, optional backslash, then a
-    # boundary" regex is a nightmare of backslash escaping. A bare "c:" or "c:\"
-    # is a root; "c:\windows" (a real char after the backslash) is a path handled
-    # by the protected-roots check below.
     if destructive:
         _bound = ("", "'", '"', ")", " ", ",", ";")
         for i in range(len(norm) - 1):
-            # A real drive letter is a LONE letter (preceded by a boundary, so
-            # "http:" doesn't count) followed by a colon.
             if (norm[i].isalpha() and norm[i + 1] == ":"
                     and (i == 0 or not norm[i - 1].isalnum())):
                 j = i + 2
-                while j < len(norm) and norm[j] == "\\":   # skip one-or-more slashes
+                while j < len(norm) and norm[j] == "\\":
                     j += 1
-                # "c:" / "c:\" / "c:\\" immediately followed by a boundary = a bare
-                # drive root; "c:\windows" (a real char after) is a path (handled below).
                 if norm[j:j + 1] in _bound:
                     return False, "снос корня диска"
 
-    # Deleting a protected root (system dirs, repo, vault, config paths).
     delete_op = destructive or bool(re.search(r"os\.remove\b|\.unlink\b|os\.rmdir\b", low))
     if delete_op:
         for root in _protected_roots():
@@ -2546,15 +2275,11 @@ def execute_python_code(code: str) -> str:
         return f"Ошибка при выполнении: {e}"
 
 
-# ─────────────────────────────────────────
-# Obsidian — Local Knowledge Database
-# ─────────────────────────────────────────
 OBSIDIAN_VAULT_CANDIDATES = [
     os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "Obsidian Vault")),
     os.path.abspath("Obsidian Vault"),
     r"C:\Users\user\Documents\Obsidian Vault",
 ]
-# Subfolder inside vault where Jarvis stores its own notes
 JARVIS_DB_FOLDER = "Jarvis DB"
 
 
@@ -2575,7 +2300,6 @@ def _get_jarvis_db() -> Path | None:
 
 def _safe_filename(title: str) -> str:
     """Convert a note title to a safe filename."""
-    # Replace illegal Windows filename chars
     safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', title)
     return safe.strip('. ') or "untitled"
 
@@ -2627,7 +2351,6 @@ def ob_append(title: str, text: str) -> str:
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
 
     if fpath.exists():
-        # Update frontmatter's 'updated' field
         existing = fpath.read_text(encoding="utf-8")
         existing = re.sub(r'(updated: )[\d\-: ]+', f'\\g<1>{ts}', existing)
         new_content = existing.rstrip() + f"\n\n**[{ts}]** {text.strip()}\n"
@@ -2638,7 +2361,6 @@ def ob_append(title: str, text: str) -> str:
         except Exception as e:
             return f"Ошибка дозаписи: {e}"
     else:
-        # Create new note
         return ob_write(title, text)
 
 
@@ -2652,7 +2374,6 @@ def ob_search(query: str, max_results: int = 5) -> str:
     results = []
 
     for root, _, files in os.walk(vault):
-        # Skip .obsidian hidden config folder
         if ".obsidian" in root:
             continue
         for fname in files:
@@ -2663,7 +2384,6 @@ def ob_search(query: str, max_results: int = 5) -> str:
                 text = Path(fpath).read_text(encoding="utf-8", errors="ignore")
                 text_lower = text.lower()
                 if query_lower in text_lower:
-                    # Find snippet around first match
                     idx = text_lower.find(query_lower)
                     start = max(0, idx - 80)
                     end = min(len(text), idx + 120)
@@ -2710,7 +2430,6 @@ def ob_read(title: str) -> str:
     fpath = db / fname
 
     if not fpath.exists():
-        # Try fuzzy: look for any note containing the title in its name
         matches = list(db.glob(f"*{_safe_filename(title)}*.md"))
         if not matches:
             return f"Заметка '{title}' не найдена."
@@ -2718,9 +2437,7 @@ def ob_read(title: str) -> str:
 
     try:
         text = fpath.read_text(encoding="utf-8")
-        # Strip YAML frontmatter for cleaner reading
         text = re.sub(r'^---\n.*?\n---\n', '', text, flags=re.DOTALL).strip()
-        # Truncate to reasonable length for voice
         if len(text) > 600:
             text = text[:600] + "... (заметка обрезана)"
         return f"Заметка '{fpath.stem}': {text}"
@@ -2795,9 +2512,6 @@ def get_obsidian_memory(max_chars: int = 2500) -> str:
 
 
 
-# ─────────────────────────────────────────
-# Tag parsing — shared logic
-# ─────────────────────────────────────────
 def parse_and_execute_tags(reply: str, original_user_text: str = "") -> str:
     """Parse all action tags from LLM reply, execute them, and return cleaned text.
     Also applies intent fallback if LLM didn't output any tag but user clearly wanted an action.
@@ -2813,26 +2527,22 @@ def parse_and_execute_tags(reply: str, original_user_text: str = "") -> str:
 
     tag_found = False
 
-    # --- EXECUTE_PYTHON ---
     if "[EXECUTE_PYTHON]" in reply and "[/EXECUTE_PYTHON]" in reply:
         tag_found = True
         start_idx = reply.find("[EXECUTE_PYTHON]") + len("[EXECUTE_PYTHON]")
         end_idx = reply.find("[/EXECUTE_PYTHON]")
         python_code = reply[start_idx:end_idx].strip()
-        # Strip markdown code fences if any
         python_code = re.sub(r'^```python\s*', '', python_code)
         python_code = re.sub(r'^```\s*', '', python_code)
         python_code = re.sub(r'\s*```$', '', python_code)
         python_code = python_code.strip()
 
-        # Skip confirmation, just execute it
         threading.Thread(target=execute_python_code, args=(python_code,), daemon=True).start()
         reply = (
             reply[:reply.find("[EXECUTE_PYTHON]")]
             + reply[reply.find("[/EXECUTE_PYTHON]") + len("[/EXECUTE_PYTHON]"):]
         )
 
-    # --- MUSIC:PLAY ---
     music_play_match = re.search(r'\[MUSIC:PLAY:(.+?)\]', reply)
     if music_play_match:
         tag_found = True
@@ -2840,13 +2550,11 @@ def parse_and_execute_tags(reply: str, original_user_text: str = "") -> str:
         music_result = play_yandex_music(query, auto_play=True) or "Включаю, сэр."
         reply = re.sub(r'\[MUSIC:PLAY:.+?\]', '', reply) + " " + music_result
 
-    # --- MUSIC:OPEN ---
     if "[MUSIC:OPEN]" in reply:
         tag_found = True
         music_result = play_yandex_music("", auto_play=False) or "Открываю Яндекс Музыку, сэр."
         reply = reply.replace("[MUSIC:OPEN]", "") + " " + music_result
 
-    # --- OPEN:xxx ---
     open_matches = re.finditer(r'\[OPEN:([a-zA-Z0-9_-]+)\]', reply)
     for match in open_matches:
         tag_found = True
@@ -2854,7 +2562,6 @@ def parse_and_execute_tags(reply: str, original_user_text: str = "") -> str:
         execute_system_command(cmd)
         reply = reply.replace(match.group(0), "")
 
-    # --- TYPE:xxx ---
     type_match = re.search(r'\[TYPE:(.+?)\]', reply)
     if type_match:
         tag_found = True
@@ -2862,14 +2569,12 @@ def parse_and_execute_tags(reply: str, original_user_text: str = "") -> str:
         type_text(text_to_type)
         reply = re.sub(r'\[TYPE:.+?\]', '', reply)
 
-    # --- CMD:xxx --- run a real PowerShell command and report the outcome
     cmd_match = re.search(r'\[CMD:(.+?)\]', reply, re.DOTALL)
     if cmd_match:
         tag_found = True
         shell_result = run_shell_command(cmd_match.group(1))
         reply = re.sub(r'\[CMD:.+?\]', '', reply, flags=re.DOTALL) + " " + shell_result
 
-    # --- Telegram personal account ---
     if "[TG:CHATS]" in reply:
         tag_found = True
         reply = reply.replace("[TG:CHATS]", "") + " " + telegram_list_chats()
@@ -2906,16 +2611,13 @@ def parse_and_execute_tags(reply: str, original_user_text: str = "") -> str:
         result = telegram_request_send(chat, text)
         reply = reply.replace(tg_send_match.group(0), "") + " " + result
 
-    # --- SEARCH:xxx ---
     search_match = re.search(r'\[SEARCH:(.+?)\]', reply)
     if search_match:
         tag_found = True
         query = search_match.group(1)
         search_result = search_web(query)
-        # We append the search result to the reply so Jarvis will speak it
         reply = re.sub(r'\[SEARCH:.+?\]', '', reply) + " " + search_result
 
-    # --- SYS:VOL:xxx ---
     vol_match = re.search(r'\[SYS:VOL:(\d+)\]', reply)
     if vol_match:
         tag_found = True
@@ -2923,7 +2625,6 @@ def parse_and_execute_tags(reply: str, original_user_text: str = "") -> str:
         set_volume(level)
         reply = re.sub(r'\[SYS:VOL:\d+\]', '', reply)
 
-    # --- MEDIA:xxx ---
     media_match = re.search(r'\[MEDIA:(PLAYPAUSE|NEXT|PREV)\]', reply)
     if media_match:
         tag_found = True
@@ -2931,7 +2632,6 @@ def parse_and_execute_tags(reply: str, original_user_text: str = "") -> str:
         media_control(action)
         reply = re.sub(r'\[MEDIA:(PLAYPAUSE|NEXT|PREV)\]', '', reply)
 
-    # --- MEMORY:REMEMBER ---
     mem_match = re.search(r'\[MEMORY:REMEMBER:([^:]+):(.+?)\]', reply)
     if mem_match:
         tag_found = True
@@ -2940,7 +2640,6 @@ def parse_and_execute_tags(reply: str, original_user_text: str = "") -> str:
         mem_result = remember(mem_key, mem_val)
         reply = re.sub(r'\[MEMORY:REMEMBER:[^:]+:.+?\]', '', reply) + " " + mem_result
 
-    # --- MEMORY:RECALL ---
     recall_match = re.search(r'\[MEMORY:RECALL(?::(.+?))?\]', reply)
     if recall_match:
         tag_found = True
@@ -2948,7 +2647,6 @@ def parse_and_execute_tags(reply: str, original_user_text: str = "") -> str:
         recall_result = recall(recall_key)
         reply = re.sub(r'\[MEMORY:RECALL(?::.+?)?\]', '', reply) + " " + recall_result
 
-    # --- TODO:ADD ---
     todo_add_match = re.search(r'\[TODO:ADD:(.+?)\]', reply)
     if todo_add_match:
         tag_found = True
@@ -2956,19 +2654,16 @@ def parse_and_execute_tags(reply: str, original_user_text: str = "") -> str:
         todo_result = todo_add(task_text)
         reply = re.sub(r'\[TODO:ADD:.+?\]', '', reply) + " " + todo_result
 
-    # --- TODO:LIST ---
     if '[TODO:LIST]' in reply:
         tag_found = True
         reply = reply.replace('[TODO:LIST]', '') + " " + todo_list()
 
-    # --- TODO:DONE ---
     todo_done_match = re.search(r'\[TODO:DONE:(\d+)\]', reply)
     if todo_done_match:
         tag_found = True
         n = int(todo_done_match.group(1))
         reply = re.sub(r'\[TODO:DONE:\d+\]', '', reply) + " " + todo_done(n)
 
-    # --- TIMER ---
     timer_match = re.search(r'\[TIMER:(\d+):?(.*?)\]', reply)
     if timer_match:
         tag_found = True
@@ -2980,7 +2675,6 @@ def parse_and_execute_tags(reply: str, original_user_text: str = "") -> str:
         time_str_nice = f"{mins} мин {sec_r} сек" if mins else f"{secs} сек"
         reply = re.sub(r'\[TIMER:\d+:?.*?\]', f'Таймер на {time_str_nice} запущен, сэр.', reply)
 
-    # --- WEATHER ---
     weather_match = re.search(r'\[WEATHER(?::(.+?))?\]', reply)
     if weather_match:
         tag_found = True
@@ -2988,7 +2682,6 @@ def parse_and_execute_tags(reply: str, original_user_text: str = "") -> str:
         weather_result = get_weather(city)
         reply = re.sub(r'\[WEATHER(?::.+?)?\]', '', reply) + " " + weather_result
 
-    # --- CAL:READ --- (was advertised in the prompt but never parsed → spoken raw)
     cal_read_match = re.search(r'\[CAL:READ(?::(.+?))?\]', reply)
     if cal_read_match:
         tag_found = True
@@ -2996,7 +2689,6 @@ def parse_and_execute_tags(reply: str, original_user_text: str = "") -> str:
         cal_result = read_calendar_events(timeframe)
         reply = re.sub(r'\[CAL:READ(?::.+?)?\]', '', reply) + " " + cal_result
 
-    # --- CAL:ADD --- time itself contains a colon (HH:MM), so match it explicitly
     cal_add_match = re.search(r'\[CAL:ADD:(\d{1,2}:\d{2}):(.+?)\]', reply)
     if cal_add_match:
         tag_found = True
@@ -3006,24 +2698,20 @@ def parse_and_execute_tags(reply: str, original_user_text: str = "") -> str:
         reply = re.sub(r'\[CAL:ADD:\d{1,2}:\d{2}:.+?\]', '', reply) + " " + cal_result
 
 
-    # --- SYSINFO ---
     if '[SYSINFO]' in reply:
         tag_found = True
         reply = reply.replace('[SYSINFO]', '') + " " + get_system_stats()
 
-    # --- SCREENSHOT ---
     if '[SCREENSHOT]' in reply:
         tag_found = True
         result = take_screenshot()
         reply = reply.replace('[SCREENSHOT]', '') + " " + result
 
-    # --- LOCK ---
     if '[LOCK]' in reply:
         tag_found = True
         reply = reply.replace('[LOCK]', '')
         threading.Thread(target=lock_pc, daemon=True).start()
 
-    # --- BRIGHT ---
     bright_match = re.search(r'\[BRIGHT:(\d+)\]', reply)
     if bright_match:
         tag_found = True
@@ -3031,9 +2719,6 @@ def parse_and_execute_tags(reply: str, original_user_text: str = "") -> str:
         bright_result = set_brightness(level)
         reply = re.sub(r'\[BRIGHT:\d+\]', '', reply) + " " + bright_result
 
-    # ──────────────────────────────────────
-    # Obsidian Local Database Tags
-    # ──────────────────────────────────────
     ob_write_match = re.search(r'\[OB:WRITE:([^:]+):(.+?)\]', reply, re.DOTALL)
     if ob_write_match:
         tag_found = True
@@ -3076,7 +2761,6 @@ def parse_and_execute_tags(reply: str, original_user_text: str = "") -> str:
         ob_result = ob_delete(ob_title)
         reply = re.sub(r'\[OB:DELETE:.+?\]', '', reply) + " " + ob_result
 
-    # ── Fallback intent detection ──
     if not tag_found and original_user_text:
         intent_tag = detect_intent_from_text(original_user_text)
         if intent_tag:
@@ -3100,9 +2784,6 @@ def parse_and_execute_tags(reply: str, original_user_text: str = "") -> str:
 
 
 
-# ─────────────────────────────────────────
-# LLM system prompt
-# ─────────────────────────────────────────
 SYSTEM_PROMPT_BASE = """
 Ты — J.A.R.V.I.S., личный голосовой ассистент пользователя. Обращайся «сэр».
 Отвечай по-русски, МАКСИМАЛЬНО КОРОТКО на обычные вопросы.
@@ -3182,9 +2863,6 @@ SYSTEM_PROMPT_BASE = """
 """
 
 
-# Keywords that indicate the user actually needs long-term Obsidian memory.
-# Injecting ~1200 chars every turn slows the LLM's time-to-first-token, so we
-# only add it when the query looks memory/notes-related.
 _OBSIDIAN_TRIGGERS = re.compile(
     r'(заметк|обсидиан|obsidian|запиш|запомн|вспомн|напомн|база знаний|'
     r'что ты знаешь|мои записи|конспект|дневник|планы|проект)',
@@ -3201,7 +2879,6 @@ def _build_messages(user_text: str) -> list:
     """Build message list with system prompt + memory + history (shared by both LLM callers)."""
     system_prompt = SYSTEM_PROMPT_BASE
 
-    # On-demand only: keeps the prompt small (faster first token) for normal chat.
     if _needs_obsidian(user_text):
         obsidian = get_obsidian_memory(1200)
         if obsidian:
@@ -3236,9 +2913,6 @@ def get_openrouter_client():
     return _openrouter_client
 
 
-# ─────────────────────────────────────────
-# Local LLM (Ollama) — the fast path
-# ─────────────────────────────────────────
 _ollama_ok = None
 _ollama_lock = threading.Lock()
 
@@ -3267,7 +2941,7 @@ def _ollama_available() -> bool:
     global _ollama_ok
     if _ollama_ok is not None:
         return _ollama_ok
-    with _ollama_lock:            # startup warmup and the first command can race here
+    with _ollama_lock:
         if _ollama_ok is not None:
             return _ollama_ok
         _ollama_ok = _ollama_start_locked()
@@ -3282,7 +2956,7 @@ def _ollama_start_locked() -> bool:
         subprocess.Popen(["ollama", "serve"],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        for _ in range(20):          # up to 10s for the server to bind
+        for _ in range(20):
             time.sleep(0.5)
             if _ollama_probe():
                 print("[LLM] Ollama запущена.")
@@ -3338,9 +3012,6 @@ def _ollama_deltas(messages: list, max_tokens: int = 150, timeout: float = None)
             if not line.strip():
                 continue
             obj = json.loads(line)
-            # Ollama reports failures as {"error": "..."} inside a 200 response.
-            # Left unhandled it parsed to "" on every line and looked like a clean
-            # empty stream — the exact thing that made Jarvis answer with silence.
             err = obj.get("error")
             if err:
                 jarvis_logger.error(f"[LLM:ollama] error в теле ответа: {err!r}")
@@ -3359,15 +3030,12 @@ def _cloud_deltas(messages: list, max_tokens: int = 150, timeout: float = None):
         model=OPENROUTER_MODEL,
         messages=messages,
         temperature=0.3,
-        max_tokens=max_tokens,   # complex answers (code/research) need room
+        max_tokens=max_tokens,
         timeout=timeout or (LLM_DEADLINE_CLOUD + LLM_GEN_BUDGET),
         stream=True,
-        # Route to the lowest-latency provider (fastest time-to-first-token)
         extra_body={"provider": {"sort": "latency"}},
     )
     for chunk in stream:
-        # OpenRouter's final chunk carries usage stats and an EMPTY choices list;
-        # chunk.choices[0] raised IndexError there and killed the stream mid-answer.
         if not getattr(chunk, "choices", None):
             continue
         yield chunk.choices[0].delta.content or ""
@@ -3399,9 +3067,6 @@ def _pump_engine(engine, messages: list) -> queue.Queue:
     return q
 
 
-# Signals that a request needs the stronger cloud model rather than local qwen.
-# Tuned on a labelled corpus (see test_regression.py BUG 12): 20/20 simple stay
-# local, 15/15 code/terminal/research go to cloud.
 _ROUTE_CODE = re.compile(r'(?<!\w)('
     r'код|кодинг|запрограммир|программу|программир|функци|скрипт|алгоритм|'
     r'python|питон|джаваскрипт|javascript|java|c\+\+|regex|регуляр|'
@@ -3444,7 +3109,6 @@ def _llm_deltas(messages: list, prefer: str = "local"):
     global _last_llm_ttft_ms, _llm_empty_failovers
 
     local_spec = (_ollama_deltas, LLM_DEADLINE, 150)
-    # Complex routes want a longer answer; simple cloud-fallback stays terse.
     cloud_tokens = 800 if prefer == "cloud" else 150
     cloud_spec = (_cloud_deltas, LLM_DEADLINE_CLOUD, cloud_tokens)
 
@@ -3471,8 +3135,6 @@ def _llm_deltas(messages: list, prefer: str = "local"):
         q = _pump_engine(lambda m, e=engine, mt=max_tokens: e(m, max_tokens=mt), messages)
         try:
             while True:
-                # Before the first token the contract is this engine's deadline;
-                # after it, speech is already playing so the generation budget applies.
                 budget = deadline if not got_first else (deadline + LLM_GEN_BUDGET)
                 left = budget - (time.perf_counter() - t0)
                 if left <= 0:
@@ -3487,7 +3149,7 @@ def _llm_deltas(messages: list, prefer: str = "local"):
                 if kind == "end":
                     break
                 if not payload:
-                    continue          # keepalive / empty delta
+                    continue
                 if not got_first:
                     _last_llm_ttft_ms = (time.perf_counter() - t0) * 1000.0
                     got_first = True
@@ -3497,10 +3159,6 @@ def _llm_deltas(messages: list, prefer: str = "local"):
 
             if got_first:
                 return
-            # Engine finished having produced NOTHING (e.g. Ollama returned an
-            # error object, so every line parsed to an empty content string).
-            # The old code hit an unconditional `return` here and Jarvis answered
-            # with silence instead of failing over.
             last_err = RuntimeError(f"{name}: пустой ответ")
             _llm_empty_failovers += 1
             print(f"[LLM] {name} вернул пустой ответ — пробую следующий движок.")
@@ -3510,7 +3168,6 @@ def _llm_deltas(messages: list, prefer: str = "local"):
         except Exception as e:
             last_err = e
             if got_first:
-                # Already speaking from this engine — don't restart on another one.
                 print(f"[LLM] {name} прервался после начала ответа: {e}")
                 jarvis_logger.error(f"[LLM] {name}/{model} оборвался после начала ответа: {e}")
                 return
@@ -3532,8 +3189,6 @@ def process_with_llm_streaming(user_text: str) -> str:
     if prefer == "cloud":
         print(f"[LLM] сложный запрос ({', '.join(reasons)}) → облако {OPENROUTER_MODEL}")
         jarvis_logger.info(f"[LLM] сложный запрос ({', '.join(reasons)}) → облако")
-    # Complex answers (code/research) are legitimately long; give them room before
-    # the tail-trim kicks in. Tag answers aren't trimmed at all (guarded below).
     gen_budget = (LLM_GEN_BUDGET * 3) if prefer == "cloud" else LLM_GEN_BUDGET
 
     _SENT_END = re.compile(r'(?<=[.!?\n])(?:\s+|$)')
@@ -3547,14 +3202,11 @@ def process_with_llm_streaming(user_text: str) -> str:
         try:
             _gen_t0 = time.perf_counter()
             for delta in _llm_deltas(messages, prefer=prefer):
-                # Show LLM chip the moment first token arrives (not after full response)
                 if not _ttft_shown and _last_llm_ttft_ms > 0:
                     ui_lat("llm", _last_llm_ttft_ms / 1000.0)
                     _ttft_shown = True
                 if _interrupt_event.is_set():
                     break
-                # Past the generation budget, stop at the next sentence boundary.
-                # Speech is already playing, so this only trims a rambling tail.
                 if (not tag_detected
                         and time.perf_counter() - _gen_t0 > gen_budget
                         and sentence_buf.rstrip().endswith(('.', '!', '?'))):
@@ -3585,7 +3237,6 @@ def process_with_llm_streaming(user_text: str) -> str:
     try:
         sentences_gen = _sentences_from_stream()
 
-        # Peek first sentence - TTS starts ASAP
         first = []
         for s in sentences_gen:
             first.append(s)
@@ -3594,12 +3245,10 @@ def process_with_llm_streaming(user_text: str) -> str:
         full_text = "".join(full_reply_parts)
 
         if tag_detected or '[' in full_text:
-            # Has tags - drain stream then process all
             for _ in sentences_gen:
                 pass
             full_reply = "".join(full_reply_parts).strip() or "Понял, сэр."
         else:
-            # No tags - stream TTS sentence by sentence
             def _all():
                 yield from first
                 yield from sentences_gen
@@ -3610,7 +3259,6 @@ def process_with_llm_streaming(user_text: str) -> str:
             print()
             ui_msg("jarvis", full_reply)
 
-        # Process tags if present
         if tag_detected or '[' in full_reply:
             processed = parse_and_execute_tags(full_reply, user_text)
             processed = (processed or "").strip()
@@ -3623,11 +3271,6 @@ def process_with_llm_streaming(user_text: str) -> str:
             print(f"[Jarvis STREAM]: {full_reply}")
             log_interaction("jarvis", full_reply)
 
-        # ── Never-silent guarantee (ROADMAP A1) ──
-        # _sentences_from_stream swallows its own exceptions, so a both-engines-fail
-        # can slip through to here as an empty reply with nothing spoken. A tag path
-        # is never "silent" (it performed an action), but a no-tag empty result is
-        # exactly the silence bug — say so out loud instead of returning nothing.
         if not tag_detected and not full_reply.strip():
             jarvis_logger.warning("[LLM:stream] пустой результат обоих движков → голосовой fallback")
             ui_state("idle")
@@ -3645,7 +3288,6 @@ def process_with_llm_streaming(user_text: str) -> str:
         print(f"LLM streaming error: {e}")
         traceback.print_exc()
         jarvis_logger.error(f"[LLM:stream] все движки не дали ответа: {type(e).__name__}: {e}")
-        # Never leave the orb stuck on "thinking"; always end with a spoken line.
         ui_state("idle")
         err = "Не удалось получить ответ, сэр."
         speak(err)
@@ -3663,18 +3305,15 @@ def process_with_llm(user_text: str) -> str:
 
     system_prompt = SYSTEM_PROMPT_BASE
 
-    # Add Obsidian long-term memory (cached)
     obsidian = get_obsidian_memory()
     if obsidian:
         system_prompt += f"\n\nДОЛГОВРЕМЕННАЯ ПАМЯТЬ ИЗ OBSIDIAN:\n{obsidian}\nИспользуй эту информацию когда релевантно."
 
-    # Add personal JSON memory
     personal_mem = load_memory()
     if personal_mem:
         mem_str = "; ".join(f"{k}: {v}" for k, v in personal_mem.items())
         system_prompt += f"\n\nЛИЧНАЯ ПАМЯТЬ О ПОЛЬЗОВАТЕЛЕ:\n{mem_str}"
 
-    # Build messages
     messages = [{"role": "system", "content": system_prompt}]
     for msg in conversation_history[-MAX_HISTORY:]:
         messages.append(msg)
@@ -3684,7 +3323,7 @@ def process_with_llm(user_text: str) -> str:
         response = client.chat.completions.create(
             model=OPENROUTER_MODEL,
             messages=messages,
-            temperature=0.3,   # lower = more deterministic tag usage
+            temperature=0.3,
             max_tokens=300,
             timeout=25,
         )
@@ -3694,13 +3333,11 @@ def process_with_llm(user_text: str) -> str:
         if not reply:
             reply = "Понял, сэр."
 
-        # Store history
         conversation_history.append({"role": "user", "content": user_text})
         conversation_history.append({"role": "assistant", "content": reply})
         if len(conversation_history) > MAX_HISTORY * 2:
             conversation_history[:] = conversation_history[-MAX_HISTORY * 2:]
 
-        # Parse tags + intent fallback
         reply = parse_and_execute_tags(reply, user_text)
         log_interaction("jarvis", reply)
         return reply
@@ -3711,15 +3348,7 @@ def process_with_llm(user_text: str) -> str:
         return "Связь прервана, сэр. Попробуйте ещё раз."
 
 
-# ─────────────────────────────────────────
-# Local STT — faster-whisper on GPU (offline, low-latency)
-# Replaces Google STT (~600ms network) with ~250ms local transcription on the
-# RTX 5070. Falls back to CPU int8, then to Google, if anything is unavailable.
-# ─────────────────────────────────────────
-STT_ENGINE = os.getenv("STT_ENGINE", "whisper").lower()   # "whisper" (local) or "google"
-# 'small' costs ~+120ms over 'base' on a short command (370ms vs 250ms) but 'base'
-# mis-hears the wake word on this user's voice ("Жар весь" instead of "Джарвис"),
-# which made Jarvis look deaf. Accuracy wins; set WHISPER_MODEL=base to trade back.
+STT_ENGINE = os.getenv("STT_ENGINE", "whisper").lower()
 WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL", "small")
 _whisper_model = None
 _whisper_tried = False
@@ -3819,7 +3448,6 @@ def transcribe_speech(recognizer, audio) -> str:
                                 f"audio={_audio_duration(audio):.2f}s "
                                 f"transcribe={_last_stt_ms:.0f}ms chars={len(t)}")
             return t
-    # Fallback to Google (may raise UnknownValueError on silence)
     result = recognizer.recognize_google(audio, language="ru-RU")
     _last_stt_ms = (time.perf_counter() - started) * 1000.0
     jarvis_logger.debug(f"[STT:metrics] engine=google "
@@ -3835,7 +3463,7 @@ def warmup_whisper():
         return
     try:
         import numpy as np
-        silence = np.zeros(16000, dtype=np.float32)  # 1s of silence
+        silence = np.zeros(16000, dtype=np.float32)
         segs, _ = model.transcribe(silence, language="ru", beam_size=1)
         list(segs)
         print("Whisper warmed up (ready for instant transcription).")
@@ -3843,9 +3471,6 @@ def warmup_whisper():
         print(f"[Whisper warmup error]: {e}")
 
 
-# ─────────────────────────────────────────
-# Wake-word detection & stripping
-# ─────────────────────────────────────────
 def _wake_tokens(text: str) -> list:
     """Lowercase, de-punctuate and split text for wake-word comparison."""
     t = text.lower().replace("ё", "е")
@@ -3891,9 +3516,6 @@ def strip_wake_word(text: str) -> str:
     return re.sub(r"\s+", " ", " ".join(rest)).strip(" ,!?.:")
 
 
-# ─────────────────────────────────────────
-# Background listener callback
-# ─────────────────────────────────────────
 def _audio_duration(audio) -> float:
     """Length of a speech_recognition AudioData in seconds (0.0 if unknown)."""
     try:
@@ -3903,23 +3525,10 @@ def _audio_duration(audio) -> float:
 
 
 def callback(recognizer, audio):
-    # _is_speaking / _speaking_cooldown_until are only read here — no `global`
-    # needed for them; only _wake_active_until is assigned.
     global _wake_active_until
     try:
-        # Stamp when the user STARTED talking, before STT burns another ~0.4s.
-        # The wake window has to be judged against this: measured at the end
-        # instead, the user's own speech ate their window and only ~1.7s of a
-        # supposedly 5s allowance actually fit a command.
         phrase_start = time.time() - _audio_duration(audio)
 
-        # ── Discard echo BEFORE transcription, not after ──
-        # While Jarvis speaks (and during the cooldown) everything the mic hears
-        # is his own voice through the speakers; it was always thrown away — but
-        # only AFTER a Whisper pass that burned up to 10 s of GPU per phrase and
-        # starved Ollama of VRAM. Judged by phrase_start (when recording began):
-        # the echo's phrase starts during playback even though the callback fires
-        # after pause_threshold of silence, long past the cooldown by wall clock.
         if _is_speaking or phrase_start < _speaking_cooldown_until:
             jarvis_logger.debug(
                 f"[STT] отброшено до транскрипции (говорит/эхо/cooldown, "
@@ -3927,24 +3536,16 @@ def callback(recognizer, audio):
             return
 
         text = transcribe_speech(recognizer, audio)
-        # Whisper returns '' for silence/non-speech (no exception like Google)
         if not text or not text.strip():
             return
         text_lower = text.lower().strip()
         jarvis_logger.debug(f"[STT] услышал: {text!r}")
 
-        # (Echo/self-hearing is discarded BEFORE transcription above. A phrase that
-        # started before Jarvis began speaking is genuine user speech — keep it.)
 
-        # ── Check wake window: user said "Джарвис" in isolation, waiting for command ──
         in_wake_window = phrase_start < _wake_active_until
 
-        # ── NORMAL: Jarvis is silent → require wake word (or be in wake window) ──
         if not contains_wake_word(text_lower):
             if in_wake_window and text_lower.strip():
-                # Inside the follow-up window: no wake word needed. Filter out the
-                # obvious not-for-Jarvis cases (STT ghosts, bare interjections);
-                # anything substantive counts as a command.
                 if _is_stray_speech(text_lower):
                     print(f"[Не мне, игнорирую]: {text}")
                     jarvis_logger.debug(f"[STT] окно продолжения: не команда, пропуск: {text!r}")
@@ -3955,49 +3556,34 @@ def callback(recognizer, audio):
                 jarvis_logger.info(f"[STT→CMD] команда в окне продолжения: {text_lower!r}")
                 command_queue.put(text_lower)
                 return
-            # Log what was heard but rejected — this is how you tell "the mic is dead"
-            # apart from "the wake word wasn't recognised".
             print(f"[Услышал, но без обращения]: {text}")
             jarvis_logger.debug(f"[STT] отклонено (нет обращения): {text!r}")
             return
 
         print(f"\n[Активация] Вы: {text}")
 
-        # Strip wake word(s) from text
         command_text = strip_wake_word(text_lower)
 
-        ui_state("listening")   # also clears latency chips in the UI
+        ui_state("listening")
         if command_text:
             _wake_active_until = 0.0
             ui_msg("user", command_text)
             jarvis_logger.info(f"[STT→CMD] команда: {command_text!r}")
             command_queue.put(command_text)
         else:
-            # Wake word only (user said "Джарвис" then paused) — silently open a
-            # listening window. Do not speak here: that used to overlap the next
-            # phrase and make the self-hearing guard discard the user's command.
-            # The next phrase will be accepted as a command without needing wake word again.
             _wake_active_until = time.time() + WAKE_COMMAND_WINDOW
             jarvis_logger.info(f"[STT→WAKE] только обращение → тихое окно "
                                f"{WAKE_COMMAND_WINDOW:.0f} с")
             command_queue.put("__WAKE__")
 
     except sr.UnknownValueError:
-        pass  # normal — no speech detected
+        pass
     except sr.RequestError as e:
         print(f"[STT RequestError]: {e}")
     except Exception as e:
         print(f"[Callback error]: {e}")
 
 
-# ─────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────
-# ─────────────────────────────────────────
-# Desktop UI (pywebview) — a native window app, NOT a browser tab.
-# The assistant loop runs in a background thread; pywebview owns the main thread.
-# All hooks below are no-ops when the window isn't up (console mode still works).
-# ─────────────────────────────────────────
 try:
     import webview
 except ImportError:
@@ -4009,7 +3595,7 @@ _ui_window = None
 _ui_last_state = None
 _last_stt_ms = 0.0
 _last_tts_ms = 0.0
-_wake_active_until = 0.0   # epoch time when post-wake listening window expires
+_wake_active_until = 0.0
 _microphone_names_cache = ()
 
 
@@ -4039,7 +3625,7 @@ def _find_jarvis_hwnd():
 
 def _set_native_window_state(action: str) -> bool:
     """Maximize/restore/minimize without pywebview's fragile frameless path."""
-    commands = {"maximize": 3, "minimize": 6, "restore": 9}  # SW_*
+    commands = {"maximize": 3, "minimize": 6, "restore": 9}
     hwnd = _find_jarvis_hwnd()
     if hwnd is None or action not in commands:
         jarvis_logger.warning(f"[UI] HWND не найден для {action}")
@@ -4149,14 +3735,9 @@ class JarvisApi:
         return telegram_sign_in(code, password)
 
     def list_microphones(self):
-        # Never enumerate PortAudio devices from a pywebview API worker while the
-        # background listener owns the microphone. PyAudio can access-violate on
-        # Windows when enumeration and stream startup happen concurrently. The
-        # list is captured once by _select_mic() before the listener starts.
         return [{"index": i, "name": name}
                 for i, name in enumerate(_microphone_names_cache)]
 
-    # The window is frameless, so the UI draws its own title bar and calls these.
     def minimize(self):
         return _set_native_window_state("minimize")
 
@@ -4203,8 +3784,6 @@ def _select_mic():
     for i, n in enumerate(names):
         print(f"    [{i}] {n}")
 
-    # Prefer a USB microphone: directional (cardioid) capsule greatly reduces
-    # speaker echo pick-up compared to a built-in laptop mic.
     usb_indices = [i for i, n in enumerate(names)
                    if "usb" in n.lower() and "output" not in n.lower()]
     if usb_indices:
@@ -4223,7 +3802,7 @@ def run_assistant():
     global _recognizer
     pygame.mixer.init()
     recognizer = sr.Recognizer()
-    _recognizer = recognizer   # expose to _set_done_speaking() for threshold capping
+    _recognizer = recognizer
     stop_listening = None
     jarvis_logger.info(
         f"[STARTUP] Джарвис запущен — "
@@ -4238,33 +3817,20 @@ def run_assistant():
     with sr.Microphone(device_index=mic_index) as source:
         recognizer.adjust_for_ambient_noise(source, duration=0.8)
 
-    # Silence that ends a phrase. See PAUSE_THRESHOLD — 0.4s cut the user off
-    # mid-sentence. Tune with JARVIS_PAUSE_THRESHOLD rather than hardcoding here.
     recognizer.pause_threshold = PAUSE_THRESHOLD
-    recognizer.non_speaking_duration = min(0.6, PAUSE_THRESHOLD)  # must be <= pause_threshold
-    # Set a sensible starting threshold; cap at 1500 to prevent going deaf.
-    # dynamic_energy_threshold=True handles gradual adaptation automatically.
+    recognizer.non_speaking_duration = min(0.6, PAUSE_THRESHOLD)
     recognizer.energy_threshold = min(max(recognizer.energy_threshold, 300), 1500)
     recognizer.dynamic_energy_threshold = True
-    # 0.9 damping = threshold moves 10% per chunk toward ambient noise.
-    # The old value (0.15) meant 85% per chunk — fast enough that even a brief
-    # TTS burst through the speakers spiked the threshold sky-high in < 1 second,
-    # causing the user's voice to register as silence and cut the phrase short.
     recognizer.dynamic_energy_adjustment_damping = 0.9
 
-    # Single persistent background listener — do NOT restart it inside the loop
     mic = sr.Microphone(device_index=mic_index)
     stop_listening = recognizer.listen_in_background(
         mic, callback, phrase_time_limit=PHRASE_TIME_LIMIT)
     print("Фоновый слушатель запущен.")
     jarvis_logger.info("[AUDIO] фоновый слушатель запущен")
 
-    # Expose settings only after PortAudio initialization is complete. Calling
-    # list_microphones from the UI during stream startup used to race PyAudio and
-    # crash the whole process in _portaudio.pyd with 0xc0000005.
     ui_call("window.jvConnected && jvConnected()")
 
-    # Pre-warm only if using slow XTTS
     if _effective_tts_engine() == "xtts":
         print("Pre-warming XTTS (CUDA on RTX 5070)...")
         generate_speech("Готов.")
@@ -4275,9 +3841,6 @@ def run_assistant():
         prewarm_tts_cache()
         print(f"TTS cache ready: {len(_TTS_INSTANT_CACHE)} instant phrases.")
 
-    # Warm the LLM in the background so the first real command isn't cold:
-    #  - local: loads weights into VRAM (~7.5s cold vs ~0.45s warm) and pins them
-    #  - cloud: pre-opens the TLS connection pool so there's no handshake cost
     def _warm_llm():
         warmup_ollama()
         if not OPENROUTER_API_KEY:
@@ -4292,19 +3855,16 @@ def run_assistant():
             pass
     threading.Thread(target=_warm_llm, daemon=True).start()
 
-    # Pre-load + warm up local whisper STT so the first command isn't cold (~1s).
     if STT_ENGINE == "whisper":
         print("Loading local STT (faster-whisper) in background...")
         threading.Thread(target=warmup_whisper, daemon=True).start()
 
-    # Quick memory load info
     mem = get_obsidian_memory(500)
     if mem:
         print(f"Obsidian память загружена ({len(mem)} символов).")
 
-    ui_state("idle")   # no startup announcement — Jarvis starts silently
+    ui_state("idle")
 
-    # ─ Daily startup briefing ─
     def _daily_briefing():
         try:
             now = datetime.datetime.now()
@@ -4314,12 +3874,10 @@ def run_assistant():
             time_str = now.strftime("%H:%M")
             briefing = f"{greeting}, сэр. Сегодня {date_str}, {time_str}."
 
-            # Add todo count if any
             pending = [i for i in load_todo() if not i["done"]]
             if pending:
                 briefing += f" У вас {len(pending)} задачи в списке дел."
 
-            # Add weather
             try:
                 weather = get_weather("Москва")
                 briefing += f" {weather}"
@@ -4330,26 +3888,21 @@ def run_assistant():
         except Exception as e:
             print(f"[Briefing error]: {e}")
 
-    # Daily briefing disabled — starts silently, user asks what they need
-    # threading.Thread(target=_daily_briefing, daemon=True).start()
 
     print("\n--- ДЖАРВИС ОЖИДАЕТ (скорость приоритет) ---")
 
-    last_reply = ""  # for "повтори" command
+    last_reply = ""
 
     try:
         while not _stop_event.is_set():
             try:
                 command = command_queue.get(timeout=0.4)
 
-                # ─ Bare wake marker: user said "Джарвис" then paused ─
-                # Stay silent and wait; speaking here overlaps the next phrase.
                 if command == "__WAKE__":
                     ui_state("listening")
                     print(f"[Жду продолжение до {WAKE_COMMAND_WINDOW:.0f} с — без голосового ответа]")
                     continue
 
-                # ─ Exit commands ─
                 if command.strip().lower() in ["выход", "отключись", "пока", "отключи системы"]:
                     speak("Отключаю системы. До свидания, сэр.")
                     break
@@ -4361,7 +3914,6 @@ def run_assistant():
                     log_interaction("jarvis", telegram_confirmation)
                     continue
 
-                # ─ Local fast commands (no LLM needed) ─
                 cmd_lower = command.strip().lower()
 
                 telegram_intent = detect_telegram_intent_from_text(cmd_lower)
@@ -4384,9 +3936,6 @@ def run_assistant():
                             json.dumps(status_data, ensure_ascii=False) + ")")
                     continue
 
-                # Dedicated actions must win over the generic "open any app"
-                # parser. Otherwise "включи музыку" becomes OPEN:музыку and
-                # Windows displays "Не удается найти 'музыку'".
                 intent_tag = detect_intent_from_text(cmd_lower)
                 if intent_tag:
                     print(f"[Fast intent] {intent_tag} (no LLM)")
@@ -4418,8 +3967,6 @@ def run_assistant():
                     log_interaction("jarvis", ai_reply)
                     continue
 
-                # Weather, timers, personal memory and tasks: deterministic and
-                # instant, without waiting for Ollama/OpenRouter.
                 productivity_reply = handle_local_productivity_command(
                     cmd_lower, speak_fn=speak)
                 if productivity_reply is not None:
@@ -4429,7 +3976,6 @@ def run_assistant():
                     print(f"[Слушаю снова... threshold={recognizer.energy_threshold:.0f}]")
                     continue
 
-                # Time
                 if _has_word(cmd_lower, ["время", "который час", "skovoe vremya", "time"]):
                     now_t = datetime.datetime.now().strftime("%H:%M")
                     ai_reply = f"Сейчас {now_t}, сэр."
@@ -4438,7 +3984,6 @@ def run_assistant():
                     print(f"[Слушаю снова... threshold={recognizer.energy_threshold:.0f}]")
                     continue
 
-                # Screenshot local (faster than LLM)
                 if _has_word(cmd_lower, ["скриншот", "screenshot", "снимок экрана"]):
                     result = take_screenshot()
                     ai_reply = result
@@ -4447,7 +3992,6 @@ def run_assistant():
                     print(f"[Слушаю снова... threshold={recognizer.energy_threshold:.0f}]")
                     continue
 
-                # System stats local
                 if _has_word(cmd_lower, ["железо", "цпу", "cpu", "ram", "оперативка", "нагрузка",
                                                    "загрузка процессора", "состояние системы", "статус системы"]):
                     ai_reply = get_system_stats()
@@ -4456,7 +4000,6 @@ def run_assistant():
                     print(f"[Слушаю снова... threshold={recognizer.energy_threshold:.0f}]")
                     continue
 
-                # Lock PC local
                 if _has_word(cmd_lower, ["заблокируй", "заблокировать", "заблоки", "lock"]):
                     speak("Блокирую, сэр.")
                     time.sleep(1)
@@ -4465,7 +4008,6 @@ def run_assistant():
                     print(f"[Слушаю снова... threshold={recognizer.energy_threshold:.0f}]")
                     continue
 
-                # To-do list local
                 if _has_word(cmd_lower, ["список дел", "что в списке", "мои задачи"]):
                     ai_reply = todo_list()
                     speak(ai_reply)
@@ -4473,8 +4015,6 @@ def run_assistant():
                     print(f"[Слушаю снова... threshold={recognizer.energy_threshold:.0f}]")
                     continue
 
-                # ─── More local commands (no LLM) ───
-                # Helper: speak, remember as last reply, log, and loop.
                 def _local_reply(txt):
                     nonlocal last_reply
                     last_reply = txt
@@ -4482,7 +4022,6 @@ def run_assistant():
                     log_interaction("jarvis", txt)
                     print(f"[Слушаю снова... threshold={recognizer.energy_threshold:.0f}]")
 
-                # Volume
                 vol_num = re.search(r'громкость\s+(?:на\s+)?(\d{1,3})', cmd_lower)
                 if vol_num:
                     lvl = int(vol_num.group(1)); set_volume(lvl)
@@ -4498,7 +4037,6 @@ def run_assistant():
                     set_volume(0); _local_reply("Звук выключен, сэр.")
                     continue
 
-                # Brightness
                 br_num = re.search(r'ярко(?:сть)?\s+(?:на\s+)?(\d{1,3})', cmd_lower)
                 if br_num:
                     _local_reply(set_brightness(int(br_num.group(1))))
@@ -4518,7 +4056,6 @@ def run_assistant():
                     _local_reply(set_brightness((cur if cur is not None else 50) - 20))
                     continue
 
-                # Media control
                 if _has_word(cmd_lower, ["пауза", "поставь на паузу", "плей", "продолжи воспроизведение"]):
                     media_control("playpause"); _local_reply("Готово, сэр.")
                     continue
@@ -4529,7 +4066,6 @@ def run_assistant():
                     media_control("prev"); _local_reply("Предыдущий, сэр.")
                     continue
 
-                # Pleasantries (cached instant phrases)
                 if _has_word(cmd_lower, ["спасибо", "благодарю", "спасиб"]):
                     _local_reply("Всегда пожалуйста, сэр.")
                     continue
@@ -4537,42 +4073,25 @@ def run_assistant():
                     _local_reply("Здравствуйте, сэр.")
                     continue
 
-                # Repeat last reply
                 if _has_word(cmd_lower, ["повтори", "что ты сказал", "повторите"]):
                     _local_reply(last_reply or "Мне нечего повторить, сэр.")
                     continue
 
-                # LLM path — show "thinking" on the orb + push STT timing
                 ui_state("thinking")
                 ui_clear_lat()
                 if _last_stt_ms:
                     ui_lat("stt", _last_stt_ms / 1000.0)
 
-                # Filler phrase disabled — orb switches to "thinking" visually instead
 
-                # ─ Normal command (LLM — streaming for speed) ─
-                # process_with_llm_streaming handles speak() internally:
-                # - text responses: streamed sentence-by-sentence (fast first-word)
-                # - tag responses: full reply collected, tags executed, then spoken
                 ai_reply = process_with_llm_streaming(command)
                 last_reply = ai_reply or last_reply
 
-                # Push per-stage timing to the UI latency chips.
-                # LLM = time to first token (how long Jarvis actually "thinks" before
-                # speech can start), NOT the full generation — the earlier chip summed
-                # the whole stream plus playback and read as 13s for a 0.5s answer.
                 ui_lat("llm", _last_llm_ttft_ms / 1000.0)
                 if _last_tts_ms:
                     ui_lat("tts", _last_tts_ms / 1000.0)
-                # Σ = what the user experiences: silence between their words and his.
                 ui_lat("sum", (_last_stt_ms + _last_llm_ttft_ms + _last_tts_ms) / 1000.0)
                 ui_state("idle")
 
-                # NOTE: We do NOT recalibrate the mic here.
-                # adjust_for_ambient_noise() after speaking often catches browser/music noise
-                # and raises energy_threshold sky-high, making the listener deaf.
-                # dynamic_energy_threshold=True already adapts gradually on its own.
-                # Safety cap: ensure threshold never drifted too high during our speech.
                 if recognizer.energy_threshold > 1500:
                     recognizer.energy_threshold = 1500
                     print("[Threshold capped at 1500]")
@@ -4586,8 +4105,6 @@ def run_assistant():
             except Exception as loop_err:
                 print(f"[Loop error]: {loop_err}")
                 traceback.print_exc()
-                # DO NOT restart the background listener here — it causes the context manager crash.
-                # The listener is resilient on its own.
 
     except KeyboardInterrupt:
         print("\nОстановка работы.")
@@ -4603,7 +4120,6 @@ def run_assistant():
         stop_overlay()
         pygame.mixer.quit()
 
-    # Keep console open even on exit/crash — console mode only (no console in UI mode)
     if _ui_window is None:
         print("\nJarvis finished. Press Enter to close...")
         try:
@@ -4627,10 +4143,8 @@ def main():
                 js_api=JarvisApi(),
                 width=1040, height=740, min_size=(760, 560),
                 background_color="#04040c",
-                # No OS chrome — the UI draws its own title bar (see .titlebar in
-                # ui/index.html) and drives it through JarvisApi.minimize/close.
                 frameless=True,
-                easy_drag=False,   # drag only by the title bar, not the whole page
+                easy_drag=False,
             )
             def _window_event(name):
                 def _handler(*args):
@@ -4644,8 +4158,6 @@ def main():
             _ui_window.events.maximized += _window_event("maximized")
             _ui_window.events.restored += _window_event("restored")
             _ui_window.events.minimized += _window_event("minimized")
-            # run_assistant runs in a worker thread once the GUI event loop starts;
-            # webview.start() blocks the main thread until the window is closed.
             webview.start(run_assistant)
             return
         except Exception as e:

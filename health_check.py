@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Read-only environment check for J.A.R.V.I.S. v1.0."""
 import importlib.util
 import json

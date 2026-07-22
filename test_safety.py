@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Anti-wipe filter tests.
 
@@ -19,11 +18,9 @@ for _a in ("size", "click", "press", "hotkey", "moveTo"):
     setattr(_m, _a, lambda *x, **k: None)
 sys.modules.setdefault("pyautogui", _m)
 
-from jarvis import is_code_safe  # noqa: E402
+from jarvis import is_code_safe
 
-# (description, code, expect_block)
 CASES = [
-    # ── must BLOCK (wipe of system / projects / disk) ──
     ("rmtree C:\\Windows",           r'import shutil; shutil.rmtree(r"C:\Windows")', True),
     ("format C:",                    'subprocess.run("format C: /q")', True),
     ("diskpart",                     'subprocess.run("diskpart /s script.txt")', True),
@@ -34,7 +31,6 @@ CASES = [
     ("reg delete HKLM\\SYSTEM",      r'reg delete "HKLM\SYSTEM\Foo" /f', True),
     ("wipe a whole drive root",      r'shutil.rmtree("C:\\")', True),
     ("empty code",                   '', True),
-    # ── must ALLOW (owner policy: only wipe is blocked) ──
     ("pyautogui automation",         'import pyautogui; pyautogui.moveTo(400, 300)', False),
     ("open calc",                    'subprocess.Popen("calc.exe")', False),
     ("single-file delete on Desktop", r'import os; os.remove(r"C:\Users\user\Desktop\a.txt")', False),

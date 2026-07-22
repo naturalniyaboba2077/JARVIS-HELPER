@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Test suite for jarvis.py (no audio/microphone/API required).
 Run: python test_jarvis_functions.py
@@ -8,7 +7,6 @@ import sys
 import threading
 import time
 
-# ---- Mock heavy/platform-specific modules before importing jarvis ----
 
 os.startfile = lambda url: print(f"[MOCK] os.startfile({url})")
 
@@ -62,7 +60,6 @@ class _MockSR:
 
 sys.modules['speech_recognition'] = _MockSR()
 
-# Mock edge_tts (async, needs to behave like coroutine)
 import asyncio
 
 class _FakeCommunicate:
@@ -74,7 +71,6 @@ class _MockEdgeTTS:
 
 sys.modules['edge_tts'] = _MockEdgeTTS()
 
-# Mock openai
 import types
 openai_mod = types.ModuleType('openai')
 class _MockOpenAI:
@@ -82,7 +78,6 @@ class _MockOpenAI:
 openai_mod.OpenAI = _MockOpenAI
 sys.modules['openai'] = openai_mod
 
-# ---- Import jarvis functions ----
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     import jarvis
@@ -100,7 +95,6 @@ except ImportError as e:
     import traceback; traceback.print_exc()
     sys.exit(1)
 
-# ---- Test helpers ----
 _pass = 0
 _fail = 0
 
@@ -115,7 +109,6 @@ def check(desc, condition):
     print(f"  [{status}] {desc}")
     return condition
 
-# ================================================================
 def test_wake_word():
     print("\n=== Wake-Word Detection ===")
     check("Detects 'dzharvs' (ru)", contains_wake_word("джарвис открой браузер"))
@@ -155,7 +148,6 @@ def test_safety():
     safe, _ = is_code_safe("import pyautogui\npyautogui.press('space')")
     check("SAFE: pyautogui automation", safe)
 
-    # Anti-wipe policy (ROADMAP §2.1): benign ops on ordinary paths stay allowed.
     safe2, r2 = is_code_safe("import shutil\nshutil.rmtree('/some/path')")
     check("ANTI-WIPE allow: rmtree of an ordinary folder", safe2)
 
@@ -171,7 +163,6 @@ def test_safety():
     safe6, r6 = is_code_safe("import os\nos.remove('somefile.txt')")
     check("ANTI-WIPE allow: single-file os.remove", safe6)
 
-    # Real wipe cases must now BLOCK (were allowed under the old stub).
     b1, _ = is_code_safe(r'import shutil; shutil.rmtree(r"C:\Windows")')
     check("ANTI-WIPE block: rmtree C:\\Windows", not b1)
 
@@ -181,7 +172,6 @@ def test_safety():
     b3, _ = is_code_safe(r'shutil.rmtree(r"C:\Users\user\Documents\JARVIS")')
     check("ANTI-WIPE block: wipe the JARVIS repo", not b3)
 
-    # …but 'malware'/download stays allowed (owner policy: no content filter).
     b4, _ = is_code_safe('subprocess.call("curl -o malware.exe https://x/y.exe")')
     check("ANTI-WIPE allow: download exe (no content filter)", b4)
 
@@ -219,7 +209,6 @@ def test_tag_parsing():
 
     actions_taken = []
 
-    # Patch execute_system_command and play_yandex_music in the jarvis module
     original_exec = jarvis.execute_system_command
     original_play = jarvis.play_yandex_music
 
@@ -232,44 +221,34 @@ def test_tag_parsing():
     jarvis.play_yandex_music = mock_play
 
     try:
-        # Test [OPEN:browser] tag
         actions_taken.clear()
         result = parse_and_execute_tags("[OPEN:browser]", "открой браузер")
         check("[OPEN:browser] executed", any("browser" in a for a in actions_taken))
         check("[OPEN:browser] removed from reply", "[OPEN:browser]" not in result)
 
-        # Test [OPEN:notepad] tag
         actions_taken.clear()
         result = parse_and_execute_tags("[OPEN:notepad]", "открой блокнот")
         check("[OPEN:notepad] executed", any("notepad" in a for a in actions_taken))
 
-        # Test [OPEN:calc] tag
         actions_taken.clear()
         result = parse_and_execute_tags("[OPEN:calc]", "открой калькулятор")
         check("[OPEN:calc] executed", any("calc" in a for a in actions_taken))
 
-        # Test [MUSIC:PLAY:Prodigy] tag
         actions_taken.clear()
         result = parse_and_execute_tags("[MUSIC:PLAY:Prodigy]", "включи Prodigy")
         check("[MUSIC:PLAY:] executed", any("Prodigy" in a for a in actions_taken))
         check("[MUSIC:PLAY:] removed from reply", "[MUSIC:PLAY:" not in result)
 
-        # Test [MUSIC:OPEN] tag
         actions_taken.clear()
         result = parse_and_execute_tags("[MUSIC:OPEN]", "открой яндекс музыку")
         check("[MUSIC:OPEN] executed", len(actions_taken) > 0)
         check("[MUSIC:OPEN] removed from reply", "[MUSIC:OPEN]" not in result)
 
-        # Test intent fallback: LLM says text, no tag
         actions_taken.clear()
         result = parse_and_execute_tags("Конечно, сэр.", "открой браузер")
         check("Intent fallback triggers on no-tag reply", any("browser" in a for a in actions_taken))
         check("Intent fallback overrides LLM reply", result == "Выполняю, сэр.")
 
-        # REGRESSION: exact bug from live log —
-        # LLM replied "Какую именно музыку включить, сэр?" (question, no tag)
-        # while user said "включи музыку"
-        # Fix: fallback must fire AND replace the questioning reply
         actions_taken.clear()
         result = parse_and_execute_tags(
             "Какую именно музыку включить, сэр?",
@@ -278,17 +257,14 @@ def test_tag_parsing():
         check("REGRESSION: music fallback fires on question reply", len(actions_taken) > 0)
         check("REGRESSION: questioning reply is overridden", "Какую именно" not in result)
 
-        # Test intent fallback does NOT fire when tag was present
         actions_taken.clear()
-        result = parse_and_execute_tags("[OPEN:calc]", "открой браузер")  # user said browser, LLM gave calc
+        result = parse_and_execute_tags("[OPEN:calc]", "открой браузер")
         check("Tag takes priority over fallback (calc executed)", any("calc" in a for a in actions_taken))
 
-        # Test empty reply gets filled
         actions_taken.clear()
         result = parse_and_execute_tags("", "")
         check("Empty reply filled with default", result == "Выполняю, сэр.")
 
-        # Test EXECUTE_PYTHON safe code runs
         actions_taken.clear()
         ran = []
         _orig_exec_py = jarvis.execute_python_code
@@ -296,7 +272,6 @@ def test_tag_parsing():
             ran.append(code)
             return "ok"
         jarvis.execute_python_code = mock_exec_py
-        # patch threading.Thread
         import threading as _threading
         _orig_thread = _threading.Thread
         class _ImmediateThread:
@@ -325,16 +300,13 @@ def test_tag_parsing():
 def test_edge_tts_event_loop():
     """Make sure _run_edge_tts_sync doesn't crash with event loop issues."""
     print("\n=== edge-tts Event Loop (Windows-safe) ===")
-    # Should succeed because our mock Communicate.save is a coroutine
     result = jarvis._run_edge_tts_sync("Привет сэр.", "test_tts_output.wav")
     check("_run_edge_tts_sync returns True", result is True)
-    # Clean up if file was accidentally created
     if os.path.exists("test_tts_output.wav"):
         try: os.remove("test_tts_output.wav")
         except: pass
 
 
-# ================================================================
 if __name__ == "__main__":
     print("=" * 50)
     print("  JARVIS TEST SUITE (no audio/mic/API needed)")
