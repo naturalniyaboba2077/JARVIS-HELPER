@@ -1,15 +1,23 @@
-# Changelog
+# История изменений
 
-## 1.0.0 — 2026-07-19
+## 1.0.0 — 19 июля 2026
 
-- Local-first LLM routing with interruptible first-token deadlines and failover.
-- Local faster-whisper STT with fuzzy wake-word handling.
-- Silent post-wake command window and longer phrase capture to prevent truncated questions.
-- Automatic TTS policy: local Piper when available, edge-tts otherwise.
-- Universal Windows application launcher using the local catalog and Start Menu shortcuts.
-- Local weather, timers, memory and to-do commands without an LLM call.
-- Jarvis self-diagnostics and desktop settings panel.
-- Strict follow-up filtering with spoken-echo rejection.
-- Safer Yandex Music fallback using the global media key instead of blind mouse clicks.
-- Anti-wipe protection for generated Python and shell commands.
-- Native pywebview UI, edge overlay, structured logging and regression coverage.
+Первая версия, которой уже спокойно пользуюсь каждый день. Что в ней есть:
+
+- Распознавание речи локально (faster-whisper) с гибким срабатыванием на слово
+  «Джарвис» — прощает, когда его слышно не идеально.
+- Умная маршрутизация запросов: простое отвечает быстрая локальная модель,
+  сложное уходит в облако. Если движок молчит дольше положенного — переключается
+  на другой, а не заставляет ждать.
+- Голос через Piper (локально) или edge-tts, выбирается автоматически.
+- Куча команд работает вообще без обращения к модели: погода, таймеры, память,
+  список дел — отвечает почти мгновенно.
+- Открывает любые установленные программы по каталогу и ярлыкам из меню «Пуск».
+- Если просто позвать и замолчать — ждёт молча, не перебивает начало фразы; на
+  длинные вопросы даётся больше времени.
+- Не путает эхо своего же голоса с новой командой.
+- Своя диагностика («статус») и панель настроек прямо в окне.
+- Музыка в Яндексе включается через системную медиа-клавишу, а не вслепую мышкой.
+- Защита при выполнении кода и команд: снести систему или проект не даст.
+- Родное окно на pywebview, полоски-визуализация голоса по краю экрана, логи и
+  набор тестов.
